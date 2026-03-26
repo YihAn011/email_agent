@@ -36,3 +36,6 @@ Thumbs.db
 
 # Ignore .venv directory
 .venv/
+runtime/
+.env
+.env.local
