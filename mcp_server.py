@@ -25,6 +25,10 @@ from skills.imap_monitor.skill import (
 )
 from skills.rspamd.schemas import RspamdScanEmailInput
 from skills.rspamd.skill import RspamdScanEmailSkill
+from skills.urgency.schemas import UrgencyCheckInput
+from skills.urgency.skill import UrgencyCheckSkill
+from skills.url_reputation.schemas import UrlReputationInput
+from skills.url_reputation.skill import UrlReputationSkill
 
 
 DEFAULT_BASE_URL = os.getenv("RSPAMD_BASE_URL", "http://127.0.0.1:11333")
@@ -34,6 +38,8 @@ mcp = FastMCP(
     instructions=(
         "Use rspamd_scan_email to scan RFC822 raw emails with rspamd, and "
         "email_header_auth_check to quickly triage header authentication signals. "
+        "Use urgency_check to score the urgency/pressure level of an email using a trained classifier. "
+        "Use url_reputation_check to score URL/content phishing risk using a trained GradientBoosting model. "
         "Use setup_imap_monitor or bind_imap_mailbox plus start_imap_monitor, poll_imap_mailboxes_once, "
         "imap_monitor_status, list_recent_email_results, and scan_recent_imap_emails to manage "
         "continuous mailbox monitoring over IMAP and inspect recent emails on demand."
@@ -232,6 +238,42 @@ def scan_recent_imap_emails(
 ) -> dict[str, Any]:
     skill = ScanRecentImapEmailsSkill()
     payload = ScanRecentImapEmailsInput(email_address=email_address, limit=limit)
+    return skill.run(payload).model_dump()
+
+
+@mcp.tool(
+    name="urgency_check",
+    description=(
+        "Score the urgency/pressure level of an email using a logistic regression trained on 355k emails. "
+        "Returns urgency_label (not urgent / somewhat urgent / very urgent), urgency_score (0-1), "
+        "and risk_contribution. Call this when rspamd score is ambiguous or when social engineering "
+        "pressure is suspected."
+    ),
+)
+def urgency_check(
+    email_text: str,
+    subject: str = "",
+) -> dict[str, Any]:
+    payload = UrgencyCheckInput(email_text=email_text, subject=subject)
+    skill = UrgencyCheckSkill()
+    return skill.run(payload).model_dump()
+
+
+@mcp.tool(
+    name="url_reputation_check",
+    description=(
+        "Score URL/content phishing risk using a GradientBoosting classifier trained on 355k emails. "
+        "Extracts URL features (count, length, subdomain depth, IP URLs) from email_text automatically. "
+        "Returns phishing_score (0-1), is_suspicious flag, and risk_level. "
+        "Optimised for recall — low threshold means fewer missed phishing emails."
+    ),
+)
+def url_reputation_check(
+    email_text: str,
+    subject: str = "",
+) -> dict[str, Any]:
+    payload = UrlReputationInput(email_text=email_text, subject=subject)
+    skill = UrlReputationSkill()
     return skill.run(payload).model_dump()
 
 
