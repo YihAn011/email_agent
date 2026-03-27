@@ -39,3 +39,11 @@ Thumbs.db
 runtime/
 .env
 .env.local
+
+# Dataset — only keep normalized output, not the large raw combined file
+COMS6901-Dataset/data/raw/
+COMS6901-Dataset/data/processed/combined_raw_dataset.csv
+
+# Trained model binaries — regenerate with train.py
+skills/urgency/model/*.pkl
+skills/url_reputation/model/
