@@ -1,0 +1,32 @@
+Return-Path: <offers@deals.shopify-partner-network.com>
+Received: from smtp.sendgrid.net (smtp.sendgrid.net [167.89.123.45])
+        by mx.google.com with ESMTPS id xyz789
+        for <jw4822@columbia.edu>; Tue, 24 Feb 2026 14:30:00 -0500
+Authentication-Results: mx.google.com;
+       dkim=pass header.i=@shopify-partner-network.com header.s=sg;
+       spf=pass smtp.mailfrom=offers@deals.shopify-partner-network.com;
+       dmarc=pass header.from=shopify-partner-network.com
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=shopify-partner-network.com; s=sg; bh=xyz==; b=abc==
+From: Shopify Deals <offers@deals.shopify-partner-network.com>
+Reply-To: no-reply@shopify-partner-network.com
+To: jw4822@columbia.edu
+Subject: URGENT: Your exclusive 72-hour flash sale — up to 80% off
+Date: Tue, 24 Feb 2026 14:30:00 -0500
+Message-ID: <20260224143000.xyz@smtp.sendgrid.net>
+MIME-Version: 1.0
+Content-Type: text/html; charset=UTF-8
+List-Unsubscribe: <mailto:unsub@deals.shopify-partner-network.com>
+
+<html>
+<body>
+<p>Hi there,</p>
+<p><strong>URGENT FLASH SALE — 72 HOURS ONLY!</strong></p>
+<p>You have been selected for an EXCLUSIVE discount of up to 80% off on thousands of products.</p>
+<p>This offer EXPIRES in 72 hours. Act now before it's too late!</p>
+<p><a href="https://deals.shopify-partner-network.com/track?uid=jw4822&src=email&campaign=flash_feb26">
+CLAIM YOUR DISCOUNT NOW
+</a></p>
+<p>This offer was sent to you because you previously expressed interest in Shopify partner deals.</p>
+<p><a href="https://deals.shopify-partner-network.com/unsubscribe?uid=jw4822">Unsubscribe</a></p>
+</body>
+</html>

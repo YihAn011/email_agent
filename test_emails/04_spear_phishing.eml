@@ -1,0 +1,35 @@
+Return-Path: <it-security@columbia-university.net>
+Received: from mail.columbia-university.net (mail.columbia-university.net [185.234.219.12])
+        by mx.google.com with ESMTP id spf123
+        for <jw4822@columbia.edu>; Wed, 25 Feb 2026 11:05:00 -0500
+Authentication-Results: mx.google.com;
+       dkim=fail header.i=@columbia-university.net;
+       spf=softfail smtp.mailfrom=it-security@columbia-university.net;
+       dmarc=fail header.from=columbia-university.net
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=columbia-university.net; s=key1; bh=aaa==; b=bbb==
+From: Columbia IT Security <it-security@columbia-university.net>
+Reply-To: helpdesk@columbia-university.net
+To: jw4822@columbia.edu
+Subject: [ACTION REQUIRED] Unusual login detected on your Columbia account
+Date: Wed, 25 Feb 2026 11:05:00 -0500
+Message-ID: <20260225110500.sec@mail.columbia-university.net>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+Dear Jue Wang,
+
+Our security systems detected an unusual login attempt on your Columbia University account from:
+
+  Location: Minsk, Belarus
+  IP Address: 91.214.44.23
+  Time: 2026-02-25 10:47 UTC
+
+If this was not you, your account may be compromised. You must verify your identity within 24 hours or your account will be suspended.
+
+Click the secure link below to verify your identity immediately:
+
+https://columbia-university.net/secure/verify?token=eyJhbGciOiJIUzI1NiJ9.jw4822
+
+If you have questions, reply to this email or call our 24/7 security hotline at 1-800-555-0192.
+
+Columbia University Information Security Team

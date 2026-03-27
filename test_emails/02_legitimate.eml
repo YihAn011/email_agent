@@ -1,0 +1,28 @@
+Return-Path: <noreply@columbia.edu>
+Received: from mail.columbia.edu (mail.columbia.edu [128.59.59.60])
+        by mx.google.com with ESMTPS id abc123
+        for <jw4822@columbia.edu>; Mon, 23 Feb 2026 09:12:00 -0500
+Authentication-Results: mx.google.com;
+       dkim=pass header.i=@columbia.edu header.s=mail2024;
+       spf=pass smtp.mailfrom=noreply@columbia.edu;
+       dmarc=pass header.from=columbia.edu
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=columbia.edu; s=mail2024; h=from:to:subject:date:message-id; bh=abc123==; b=def456==
+From: Columbia University IT <noreply@columbia.edu>
+To: jw4822@columbia.edu
+Subject: Scheduled maintenance: Canvas LMS downtime this Saturday
+Date: Mon, 23 Feb 2026 09:12:00 -0500
+Message-ID: <20260223091200.abc@mail.columbia.edu>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+Dear Columbia Community,
+
+This is a reminder that Canvas LMS will be unavailable this Saturday, February 28, from 2:00 AM to 6:00 AM EST for scheduled infrastructure maintenance.
+
+During this window, you will not be able to access course materials, submit assignments, or participate in discussions.
+
+Please plan accordingly. If you have urgent deadlines, submit your work before 2:00 AM Saturday or contact your instructor.
+
+For questions, contact CUIT Help Desk at help@columbia.edu or 212-854-1919.
+
+Columbia University Information Technology
