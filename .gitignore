@@ -40,9 +40,8 @@ runtime/
 .env
 .env.local
 
-# Dataset — only keep normalized output, not the large raw combined file
-COMS6901-Dataset/data/raw/
-COMS6901-Dataset/data/processed/combined_raw_dataset.csv
+# Dataset files — too large for GitHub (442MB+), regenerate with normalize_dataset.py
+COMS6901-Dataset/data/
 
 # Trained model binaries — regenerate with train.py
 skills/urgency/model/*.pkl
