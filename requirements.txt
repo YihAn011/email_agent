@@ -3,4 +3,5 @@ pydantic>=2.7.0
 mcp
 langgraph
 langchain-google-genai
+langchain-ollama
 langchain-mcp-adapters

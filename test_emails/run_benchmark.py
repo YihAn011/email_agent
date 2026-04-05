@@ -1,5 +1,5 @@
 """
-Benchmark: Baseline (all 4 skills exhaustive) vs. Agentic (Gemini adaptive)
+Benchmark: Baseline (all 4 skills exhaustive) vs. Agentic (adaptive LLM)
 Skills: rspamd_scan_email, email_header_auth_check, urgency_check, url_reputation_check
 """
 from __future__ import annotations
@@ -13,13 +13,14 @@ from typing import Any
 
 import dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 dotenv.load_dotenv(PROJECT_ROOT / ".env")
+
+from examples.model_factory import build_chat_model, resolve_default_model, resolve_provider
 
 from skills.rspamd.schemas import RspamdScanEmailInput
 from skills.rspamd.skill import RspamdScanEmailSkill
@@ -57,6 +58,13 @@ Response requirements:
 - Clearly separate tool evidence from your own inference.
 - Mention the most important findings and recommended next step.
 """
+
+
+def build_mcp_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env.pop("PS1", None)
+    env["RSPAMD_BASE_URL"] = RSPAMD_BASE_URL
+    return env
 
 
 # ── Baseline (exhaustive — all 4 skills always) ───────────────────────────────
@@ -111,13 +119,20 @@ def run_baseline(raw_email: str) -> dict[str, Any]:
     }
 
 
-# ── Agentic (Gemini adaptive) ─────────────────────────────────────────────────
+# ── Agentic (adaptive LLM) ────────────────────────────────────────────────────
 
 async def run_agent_on_email(raw_email: str) -> dict[str, Any]:
     t0 = time.perf_counter()
 
-    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-    mcp_env = {**os.environ, "RSPAMD_BASE_URL": RSPAMD_BASE_URL}
+    provider = resolve_provider()
+    model_name = resolve_default_model(provider)
+    model = build_chat_model(
+        provider=provider,
+        model_name=model_name,
+        temperature=0,
+        ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
+    )
+    mcp_env = build_mcp_env()
 
     server_config = {
         "email-security": {
@@ -172,6 +187,8 @@ async def run_agent_on_email(raw_email: str) -> dict[str, Any]:
                 tokens_out += usage.get("output_tokens", 0)
 
     return {
+        "provider": provider,
+        "model_name": model_name,
         "verdict_text": final_text,
         "tools_called": tools_called,
         "num_tool_calls": len(tools_called),
@@ -227,7 +244,7 @@ def write_report(results: list[dict]) -> None:
         "# Email Security Benchmark Results",
         "",
         "**Baseline:** exhaustive — all 4 skills run on every email  ",
-        "**Agent:** Gemini 2.5 Flash — adaptive skill selection via MCP  ",
+        f"**Agent:** {results[0]['agent']['provider']} / {results[0]['agent']['model_name']} — adaptive skill selection via MCP  " if results else "**Agent:** adaptive LLM via MCP  ",
         "**Skills available:** `rspamd_scan_email`, `email_header_auth_check`, `urgency_check`, `url_reputation_check`",
         "",
         "---",
@@ -266,7 +283,7 @@ def write_report(results: list[dict]) -> None:
             f"- **url_reputation:** phishing_score={b['url_phishing_score']}  suspicious={b['url_suspicious']}  risk={b['url_risk']}",
             f"- **Time:** {b['elapsed_ms']} ms  (4 skills, no LLM)",
             "",
-            "#### Agent (Gemini 2.5 Flash)",
+            f"#### Agent ({a['provider']} / {a['model_name']})",
             f"- **Tools called:** {', '.join(a['tools_called']) or 'none'} ({a['num_tool_calls']} call(s))",
             f"- **Time:** {a['elapsed_ms']} ms",
             f"- **Tokens:** {a['tokens_input']} in / {a['tokens_output']} out",

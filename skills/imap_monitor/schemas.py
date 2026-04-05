@@ -87,6 +87,10 @@ class MonitorStatusResult(BaseModel):
     recent_errors: list[str] = Field(default_factory=list)
 
 
+class ListBoundImapMailboxesResult(BaseModel):
+    mailboxes: list[BoundMailbox] = Field(default_factory=list)
+
+
 class PollMailboxInput(BaseModel):
     email_address: Optional[str] = Field(
         default=None,
@@ -138,6 +142,10 @@ class ListRecentEmailResultsInput(BaseModel):
     limit: int = Field(default=10, ge=1, le=100, description="Maximum number of results to return.")
 
 
+class ListRecentEmailResultsResult(BaseModel):
+    results: list[RecentEmailResult] = Field(default_factory=list)
+
+
 class ScanRecentImapEmailsResult(BaseModel):
     email_address: str
     scanned_count: int
@@ -145,4 +153,3 @@ class ScanRecentImapEmailsResult(BaseModel):
 
 
 SetupImapMonitorResult.model_rebuild()
-

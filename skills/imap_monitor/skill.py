@@ -24,6 +24,8 @@ from .schemas import (
     BindImapMailboxResult,
     BoundMailbox,
     ListRecentEmailResultsInput,
+    ListRecentEmailResultsResult,
+    ListBoundImapMailboxesResult,
     MonitorActionResult,
     MonitorStatusResult,
     PollMailboxInput,
@@ -685,6 +687,34 @@ class ImapMonitorStatusSkill(BaseSkill[PollMailboxInput, MonitorStatusResult]):
         )
 
 
+class ListBoundImapMailboxesSkill(
+    BaseSkill[PollMailboxInput, ListBoundImapMailboxesResult]
+):
+    name = "list_bound_imap_mailboxes"
+    description = "List locally stored IMAP mailbox bindings."
+    version = "0.1.0"
+
+    def run(self, payload: PollMailboxInput) -> SkillResult[ListBoundImapMailboxesResult]:
+        del payload
+        start = perf_counter()
+        timestamp_utc = utc_now_iso()
+        records = list_mailboxes(enabled_only=False)
+        result = ListBoundImapMailboxesResult(
+            mailboxes=[_masked_mailbox(record) for record in records]
+        )
+        latency_ms = int((perf_counter() - start) * 1000)
+        return SkillResult(
+            ok=True,
+            data=result,
+            meta=SkillMeta(
+                skill_name=self.name,
+                skill_version=self.version,
+                latency_ms=latency_ms,
+                timestamp_utc=timestamp_utc,
+            ),
+        )
+
+
 class PollImapMailboxesOnceSkill(BaseSkill[PollMailboxInput, PollMailboxResult]):
     name = "poll_imap_mailboxes_once"
     description = "Poll bound IMAP mailboxes once for immediate testing."
@@ -760,7 +790,7 @@ class ScanRecentImapEmailsSkill(
 
 
 class ListRecentEmailResultsSkill(
-    BaseSkill[ListRecentEmailResultsInput, list[RecentEmailResult]]
+    BaseSkill[ListRecentEmailResultsInput, ListRecentEmailResultsResult]
 ):
     name = "list_recent_email_results"
     description = "List recent IMAP monitor analysis results."
@@ -768,12 +798,14 @@ class ListRecentEmailResultsSkill(
 
     def run(
         self, payload: ListRecentEmailResultsInput
-    ) -> SkillResult[list[RecentEmailResult]]:
+    ) -> SkillResult[ListRecentEmailResultsResult]:
         start = perf_counter()
         timestamp_utc = utc_now_iso()
         try:
             rows = list_recent_results(payload.limit, payload.email_address)
-            results = [_build_recent_result(row) for row in rows]
+            results = ListRecentEmailResultsResult(
+                results=[_build_recent_result(row) for row in rows]
+            )
             latency_ms = int((perf_counter() - start) * 1000)
             return SkillResult(
                 ok=True,
@@ -797,4 +829,3 @@ class ListRecentEmailResultsSkill(
                     timestamp_utc=timestamp_utc,
                 ),
             )
-

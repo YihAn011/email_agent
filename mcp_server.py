@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -16,6 +17,7 @@ from skills.imap_monitor.schemas import (
 from skills.imap_monitor.skill import (
     BindImapMailboxSkill,
     ImapMonitorStatusSkill,
+    ListBoundImapMailboxesSkill,
     ListRecentEmailResultsSkill,
     PollImapMailboxesOnceSkill,
     ScanRecentImapEmailsSkill,
@@ -31,6 +33,17 @@ from skills.url_reputation.schemas import UrlReputationInput
 from skills.url_reputation.skill import UrlReputationSkill
 
 
+for logger_name in (
+    "mcp",
+    "mcp.server",
+    "mcp.server.lowlevel",
+    "mcp.server.fastmcp",
+    "httpx",
+    "httpcore",
+):
+    logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
 DEFAULT_BASE_URL = os.getenv("RSPAMD_BASE_URL", "http://127.0.0.1:11333")
 
 mcp = FastMCP(
@@ -40,7 +53,8 @@ mcp = FastMCP(
         "email_header_auth_check to quickly triage header authentication signals. "
         "Use urgency_check to score the urgency/pressure level of an email using a trained classifier. "
         "Use url_reputation_check to score URL/content phishing risk using a trained GradientBoosting model. "
-        "Use setup_imap_monitor or bind_imap_mailbox plus start_imap_monitor, poll_imap_mailboxes_once, "
+        "Use list_bound_imap_mailboxes to discover already saved mailbox bindings before asking the user "
+        "for credentials again. Use setup_imap_monitor or bind_imap_mailbox plus start_imap_monitor, poll_imap_mailboxes_once, "
         "imap_monitor_status, list_recent_email_results, and scan_recent_imap_emails to manage "
         "continuous mailbox monitoring over IMAP and inspect recent emails on demand."
     ),
@@ -197,6 +211,19 @@ def stop_imap_monitor() -> dict[str, Any]:
 )
 def imap_monitor_status() -> dict[str, Any]:
     skill = ImapMonitorStatusSkill()
+    return skill.run(PollMailboxInput()).model_dump()
+
+
+@mcp.tool(
+    name="list_bound_imap_mailboxes",
+    description=(
+        "List IMAP mailboxes that are already stored locally. Use this before asking "
+        "the user for credentials again. If exactly one mailbox is bound and the user "
+        "asks about recent emails, prefer using it directly."
+    ),
+)
+def list_bound_imap_mailboxes() -> dict[str, Any]:
+    skill = ListBoundImapMailboxesSkill()
     return skill.run(PollMailboxInput()).model_dump()
 
 
