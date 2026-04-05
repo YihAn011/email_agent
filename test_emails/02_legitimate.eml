@@ -7,7 +7,7 @@ Authentication-Results: mx.google.com;
        spf=pass smtp.mailfrom=noreply@columbia.edu;
        dmarc=pass header.from=columbia.edu
 DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=columbia.edu; s=mail2024; h=from:to:subject:date:message-id; bh=abc123==; b=def456==
-From: Columbia University IT <noreply@columbia.edu>
+        From: Columbia University IT <noreply@columbia.edu>
 To: jw4822@columbia.edu
 Subject: Scheduled maintenance: Canvas LMS downtime this Saturday
 Date: Mon, 23 Feb 2026 09:12:00 -0500

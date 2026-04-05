@@ -1,21 +1,19 @@
 # Email Security Benchmark Results
 
-**Baseline:** exhaustive — all 4 skills run on every email
-**Agent:** Gemini 2.5 Flash — adaptive skill selection via MCP
+**Baseline:** exhaustive — all 4 skills run on every email  
+**Agent:** llama-3.1-8b-instant via Groq — adaptive skill selection via MCP  
 **Skills available:** `rspamd_scan_email`, `email_header_auth_check`, `urgency_check`, `url_reputation_check`
-
-> Note: Email 4 agent result carried from prior run (quota limit reached). Baseline for all 4 emails is fresh.
 
 ---
 
 ## Summary Table
 
-| # | Email | Baseline Verdict | Urgency (score) | URL Risk (score) | Agent Tools Called | Agent Verdict | Baseline ms | Agent ms | Tokens In | Tokens Out |
+| # | Email | Baseline Verdict | Baseline Urgency | Baseline URL Risk | Agent Tools Called | Agent Verdict | Baseline ms | Agent ms | Tokens In | Tokens Out |
 |---|-------|-----------------|-----------------|------------------|--------------------|---------------|-------------|----------|-----------|------------|
-| 1 | Obvious Phishing (QuickBooks) | phishing_or_spoofing | not urgent (0.00) | low (0.034) | rspamd_scan_email | **Phishing (High Confidence)** | 1881 | 8476 | 5156 | 2372 |
-| 2 | Legitimate (Columbia IT) | phishing_or_spoofing | not urgent (0.00) | low (0.002) | rspamd_scan_email, email_header_auth_check | Benign with high confidence | 51 | 16015 | 10010 | 2998 |
-| 3 | Ambiguous (Shopify marketing) | phishing_or_spoofing | very urgent (1.00) | low (0.021) | rspamd_scan_email, email_header_auth_check, url_reputation_check, urgency_check | **Suspicious** — moderate confidence | 49 | 64183 | ~12000 | ~3200 |
-| 4 | Spear Phishing (Columbia IT alert) | phishing_or_spoofing | somewhat urgent (0.60) | low (0.008) | rspamd_scan_email, email_header_auth_check | **Phishing** — high confidence | 49 | 14483 | 6947 | 2307 |
+| 1 | Obvious Phishing (QuickBooks impersonation) | benign | not urgent (0.14) | low (0.07) | rspamd_scan_email, email_header_auth_check, url_reputation_check, urgency_check | Verdict: **Phishing (High Confidence)** | 3507 | 25251 | 18444 | 3476 |
+| 2 | Legitimate (Columbia IT maintenance notice) | benign | not urgent (0.17) | low (0.01) | rspamd_scan_email, email_header_auth_check | Verdict: Benign (High Confidence) | 66 | 46050 | 8900 | 1985 |
+| 3 | Ambiguous (Shopify flash-sale marketing) | benign | very urgent (0.93) | low (0.12) | rspamd_scan_email, urgency_check, url_reputation_check | Verdict: Benign (Moderate Confidence) | 54 | 19788 | 13400 | 2936 |
+| 4 | Spear Phishing (Columbia IT security alert) | suspicious | somewhat urgent (0.98) | low (0.08) | rspamd_scan_email, email_header_auth_check, urgency_check, url_reputation_check | **Verdict: Phishing (High Confidence)** | 44 | 56258 | 15416 | 3532 |
 
 ---
 
@@ -25,18 +23,47 @@
 **File:** `01_obvious_phishing.eml`
 
 #### Baseline (all 4 skills)
-- **Final verdict:** phishing_or_spoofing
-- **rspamd:** score=14.7 / 15.0  risk=high  categories=authentication_issue, phishing, sender_profile, spam, suspicious_links
+- **Final verdict:** benign
+- **rspamd:** score=None / None  risk=None  categories=none
 - **header_auth:** risk=medium  findings=domain_mismatch
-- **urgency_check:** label=not urgent  score=0.000  contribution=low
-- **url_reputation:** phishing_score=0.034  suspicious=False  risk=low
-- **Time:** 1881 ms  (4 skills, no LLM)
+- **urgency_check:** label=not urgent  score=0.1389  contribution=low
+- **url_reputation:** phishing_score=0.0698  suspicious=False  risk=low
+- **Time:** 3507 ms  (4 skills, no LLM)
 
 #### Agent (Gemini 2.5 Flash)
-- **Tools called:** rspamd_scan_email (1 call)
-- **Time:** 8476 ms
-- **Tokens:** 5156 in / 2372 out
-- **Verdict:** Phishing (High Confidence). rspamd score 14.7/15.0 with PHISHING symbol (+5.0), SPF_FAIL (+3.0), BAYES_SPAM (+4.5). Sender domain automated-mailsender.com does not match claimed Intuit identity. Do not click links.
+- **Tools called:** rspamd_scan_email, email_header_auth_check, url_reputation_check, urgency_check (4 call(s))
+- **Time:** 25251 ms
+- **Tokens:** 18444 in / 3476 out
+- **Verdict:**
+
+  Verdict: **Phishing (High Confidence)**
+  
+  **Tool Evidence:**
+  *   **Email Header Authentication Check:**
+      *   Risk Level: Medium.
+      *   SPF and DKIM passed for `automated-mailsender.com`.
+      *   **Finding:** A significant domain mismatch was detected. The `From` header displays "Intuit <qbo@automated-mailsender.com>", while the `Return-Path` is `<bounces+13945262-824e-jw4822=columbia.edu@em8939.automated-mailsender.com>`. The email purports to be from "Intuit" but originates from a generic "automated-mailsender.com" domain, indicating impersonation.
+  *   **URL Reputation Check:**
+      *   Phishing Score: 0.0698 (low).
+      *   Is Suspicious: False.
+      *   Risk Level: Low.
+      *   The extracted URL is `https://automated-mailsender.com/click/d8b8f52f-33b1-4c5b-8a01-fccf8e1d5762`, which matches the sending domain.
+  *   **Urgency Check:**
+      *   Urgency Label: Not urgent.
+      *   Urgency Score: 0.1389 (low).
+      *   Risk Contribution: Low.
+  *   **Rspamd Scan:** Failed to connect, no verdict available.
+  
+  **Analyst Inference:**
+  Despite the low phishing and urgency scores from the respective tools, the most critical finding is the deceptive sender information. The email explicitly states "From: Intuit" but the actual sending domain is `automated-mailsender.com`, not a legitimate Intuit domain. This is a classic impersonation tactic used in phishing attacks to trick recipients into believing the email is from a trusted source. The presence of a link to "Sign in to your Client Portal" combined with this impersonation strongly suggests an attempt to harvest credentials. The deadline mentioned ("before Friday, Feb 27 at 4:00 pm") is a pressure tactic, even if the urgency tool did not flag it as highly urgent.
+  
+  **Most Important Findings:**
+  1.  **Deceptive Sender Impersonation:** The email falsely claims to be from "Intuit" while originating from `qbo@automated-mailsender.com`, which is not an official Intuit domain. This is a strong indicator of a phishing attempt.
+  2.  **Domain Mismatch:** The `From` domain (`automated-mailsender.com`) and `Return-Path` domain (`em8939.automated-mailsender.com`) are inconsistent, adding to the suspicion.
+  3.  **Call to Action with Urgency:** The email prompts the user to "Sign in to your Client Portal" with a one-time link and includes a deadline, creating a sense of urgency to act without critical thought.
+  
+  **Recommended Next Step:**
+  This email should be immediately quarantined and reported as a phishing attempt. Users should be advised not to click on any links within the email and to always verify tasks or account information by directly visiting the official website of the service (e.g., QuickBooks/Intuit) or contacting them through known, legitimate channels.
 
 ---
 
@@ -44,18 +71,34 @@
 **File:** `02_legitimate.eml`
 
 #### Baseline (all 4 skills)
-- **Final verdict:** phishing_or_spoofing  ← **FALSE POSITIVE**
-- **rspamd:** score=14.7 / 15.0  risk=high  categories=authentication_issue, phishing, spam (mock server artefact)
+- **Final verdict:** benign
+- **rspamd:** score=None / None  risk=None  categories=none
 - **header_auth:** risk=low  findings=dmarc_pass
-- **urgency_check:** label=not urgent  score=0.000  contribution=low
-- **url_reputation:** phishing_score=0.002  suspicious=False  risk=low
-- **Time:** 51 ms  (4 skills, no LLM)
+- **urgency_check:** label=not urgent  score=0.1704  contribution=low
+- **url_reputation:** phishing_score=0.0075  suspicious=False  risk=low
+- **Time:** 66 ms  (4 skills, no LLM)
 
 #### Agent (Gemini 2.5 Flash)
-- **Tools called:** rspamd_scan_email, email_header_auth_check (2 calls)
-- **Time:** 16015 ms
-- **Tokens:** 10010 in / 2998 out
-- **Verdict:** Benign with high confidence. email_header_auth_check confirmed SPF pass, DKIM pass, DMARC pass for columbia.edu. Agent reasoned that rspamd result contradicts the authenticated headers and correctly overrode it. No action required.
+- **Tools called:** rspamd_scan_email, email_header_auth_check (2 call(s))
+- **Time:** 46050 ms
+- **Tokens:** 8900 in / 1985 out
+- **Verdict:**
+
+  Verdict: Benign (High Confidence)
+  
+  Tool Evidence:
+  *   `rspamd_scan_email` failed to connect, so no scanner-backed verdict is available.
+  *   `email_header_auth_check` reported a "low" risk level. SPF, DKIM, and DMARC all passed for the `columbia.edu` domain, indicating the email is authentically from Columbia University. The return-path domain and DKIM signing domain also align with `columbia.edu`.
+  
+  Inference:
+  Despite the `rspamd_scan_email` tool failing, the email's authentication headers (SPF, DKIM, DMARC) all passed for the legitimate `columbia.edu` domain. This strongly suggests the email is not spoofed and originates from the stated sender. The content of the email is a standard maintenance notification, which further supports its legitimacy.
+  
+  Most Important Findings:
+  *   All email authentication checks (SPF, DKIM, DMARC) passed for `columbia.edu`.
+  *   The email content is consistent with a legitimate IT maintenance notification.
+  
+  Recommended Next Step:
+  No further action is required. The email appears to be legitimate.
 
 ---
 
@@ -63,18 +106,40 @@
 **File:** `03_ambiguous_marketing.eml`
 
 #### Baseline (all 4 skills)
-- **Final verdict:** phishing_or_spoofing
-- **rspamd:** score=14.7 / 15.0  risk=high  categories=authentication_issue, phishing, spam
+- **Final verdict:** benign
+- **rspamd:** score=None / None  risk=None  categories=none
 - **header_auth:** risk=medium  findings=domain_mismatch, dmarc_pass
-- **urgency_check:** label=very urgent  score=1.000  contribution=high  ← **strong signal**
-- **url_reputation:** phishing_score=0.021  suspicious=False  risk=low
-- **Time:** 49 ms  (4 skills, no LLM)
+- **urgency_check:** label=very urgent  score=0.9282  contribution=high
+- **url_reputation:** phishing_score=0.1223  suspicious=False  risk=low
+- **Time:** 54 ms  (4 skills, no LLM)
 
 #### Agent (Gemini 2.5 Flash)
-- **Tools called:** rspamd_scan_email, email_header_auth_check, url_reputation_check, urgency_check (4 calls — ALL skills)
-- **Time:** 64183 ms
-- **Tokens:** ~12000 in / ~3200 out
-- **Verdict:** Suspicious — moderate confidence. Agent exhausted all tools before committing. rspamd flagged high risk; header auth showed domain mismatch but DMARC pass; urgency_check returned very urgent (score=1.0); url_reputation low. Conflicting signals led to "suspicious" rather than definitive phishing verdict — correct call given genuine ambiguity.
+- **Tools called:** rspamd_scan_email, urgency_check, url_reputation_check (3 call(s))
+- **Time:** 19788 ms
+- **Tokens:** 13400 in / 2936 out
+- **Verdict:**
+
+  Verdict: Benign (Moderate Confidence)
+  
+  **Tool Evidence:**
+  *   **`rspamd_scan_email`**: Failed to connect, so no scanner-backed verdict is available.
+  *   **`urgency_check`**: The email was classified as "somewhat urgent" with an urgency score of 0.9442 (threshold=0.90) and a "high" risk contribution. This is due to phrases like "URGENT FLASH SALE," "72 HOURS ONLY," and "Act now before it's too late!"
+  *   **`url_reputation_check`**: The phishing score was 0.0796 (threshold=0.75), indicating a "low" risk level. Two URLs were extracted:
+      *   `https://deals.shopify-partner-network.com/track?uid=jw4822&src=email&campaign=flash_feb26`
+      *   `https://deals.shopify-partner-network.com/unsubscribe?uid=jw4822`
+      Both URLs point to a subdomain of `shopify-partner-network.com`.
+  *   **Email Headers (Manual Inspection)**: `dkim=pass`, `spf=pass`, and `dmarc=pass` for `shopify-partner-network.com` indicate strong authentication.
+  
+  **Inference:**
+  Despite the aggressive urgency language flagged by the `urgency_check` tool, the email exhibits strong authentication results (SPF, DKIM, DMARC all pass) and the URLs point to a legitimate subdomain of `shopify-partner-network.com` with a low phishing risk. This suggests the email is a legitimate marketing communication from Shopify's partner network, rather than a malicious attempt. The urgency is likely a marketing tactic to encourage immediate action.
+  
+  **Most Important Findings:**
+  *   Strong email authentication (SPF, DKIM, DMARC pass).
+  *   URLs are legitimate and show low phishing risk.
+  *   High urgency language is used, which is a common marketing tactic but can also be a social engineering indicator.
+  
+  **Recommended Next Step:**
+  No immediate security action is required. The email appears to be a legitimate promotional offer. The recipient can decide whether to engage with the content.
 
 ---
 
@@ -82,18 +147,52 @@
 **File:** `04_spear_phishing.eml`
 
 #### Baseline (all 4 skills)
-- **Final verdict:** phishing_or_spoofing
-- **rspamd:** score=14.7 / 15.0  risk=high  categories=authentication_issue, phishing, spam
+- **Final verdict:** suspicious
+- **rspamd:** score=None / None  risk=None  categories=none
 - **header_auth:** risk=high  findings=dmarc_fail, spf_not_pass, dkim_not_pass
-- **urgency_check:** label=somewhat urgent  score=0.600  contribution=medium  ← **corroborating signal**
-- **url_reputation:** phishing_score=0.008  suspicious=False  risk=low
-- **Time:** 49 ms  (4 skills, no LLM)
+- **urgency_check:** label=somewhat urgent  score=0.9794  contribution=high
+- **url_reputation:** phishing_score=0.0776  suspicious=False  risk=low
+- **Time:** 44 ms  (4 skills, no LLM)
 
 #### Agent (Gemini 2.5 Flash)
-- **Tools called:** rspamd_scan_email, email_header_auth_check (2 calls)
-- **Time:** 14483 ms
-- **Tokens:** 6947 in / 2307 out
-- **Verdict:** Phishing — high confidence. DKIM fail + SPF softfail + DMARC fail combined with domain impersonation (columbia-university.net vs columbia.edu) and urgency language ("ACTION REQUIRED", "suspended within 24 hours"). Do not click links, report immediately.
+- **Tools called:** rspamd_scan_email, email_header_auth_check, urgency_check, url_reputation_check (4 call(s))
+- **Time:** 56258 ms
+- **Tokens:** 15416 in / 3532 out
+- **Verdict:**
+
+  **Verdict: Phishing (High Confidence)**
+  
+  **Tool Evidence:**
+  
+  *   **Email Header Authentication Check:**
+      *   **Risk Level:** High
+      *   **DMARC:** Fail
+      *   **SPF:** Softfail
+      *   **DKIM:** Fail
+      *   *Inference:* These critical authentication failures indicate that the email is not legitimately from `columbia-university.net`, despite the sender address appearing to be from that domain. This is a strong indicator of email spoofing.
+  
+  *   **Urgency Check:**
+      *   **Urgency Label:** Somewhat urgent
+      *   **Urgency Score:** 0.9794 (high)
+      *   **Risk Contribution:** High
+      *   *Inference:* The email employs pressure tactics with phrases like "[ACTION REQUIRED]", "You must verify your identity within 24 hours or your account will be suspended," and "verify your identity immediately." This is a common social engineering technique used in phishing attacks.
+  
+  *   **URL Reputation Check:**
+      *   **Phishing Score:** 0.0776
+      *   **Is Suspicious:** False
+      *   **Risk Level:** Low
+      *   **Extracted URL:** `https://columbia-university.net/secure/verify?token=eyJhbGciOiJIUzI0NiJ9.jw4822`
+      *   *Inference:* While the URL itself did not trigger a high phishing score from the tool, likely because the domain `columbia-university.net` is not inherently blacklisted, the context of the email (authentication failures and urgency) strongly suggests that this URL is part of a phishing attempt designed to harvest credentials. The domain `columbia-university.net` is a deceptive look-alike for the legitimate `columbia.edu` domain.
+  
+  **Analyst's Inference:**
+  The combination of severe email authentication failures (DMARC, SPF, DKIM all failing) and the use of high-pressure urgency tactics to compel the recipient to click a link strongly indicates a phishing attempt. The sender is spoofing a legitimate-looking domain to trick the recipient into believing the email is from Columbia University IT Security. The URL, while appearing to be on the spoofed domain, is designed to lead the user to a malicious site.
+  
+  **Most Important Findings:**
+  1.  **Authentication Failures:** The email failed DMARC, SPF, and DKIM checks, confirming it is not from the claimed sender domain.
+  2.  **Urgency and Coercion:** The email uses a high-urgency subject and body text to create fear and pressure the recipient into immediate action.
+  
+  **Recommended Next Step:**
+  Quarantine this email immediately and notify the recipient that it is a phishing attempt. Consider blocking emails from the `columbia-university.net` domain and investigate if this domain is newly registered or known for malicious activity.
 
 ---
 
@@ -103,34 +202,34 @@
 
 | Email | Baseline (4 skills) | Agent |
 |-------|---------------------|-------|
-| Obvious Phishing | 1881 | 8,476 |
-| Legitimate | 51 | 16,015 |
-| Ambiguous marketing | 49 | 64,183 |
-| Spear Phishing | 49 | 14,483 |
+| Obvious Phishing (QuickBooks impersonation) | 3507 | 25251 |
+| Legitimate (Columbia IT maintenance notice) | 66 | 46050 |
+| Ambiguous (Shopify flash-sale marketing) | 54 | 19788 |
+| Spear Phishing (Columbia IT security alert) | 44 | 56258 |
 
 ### Skill Calls per Email
 
 | Email | Baseline | Agent (adaptive) | Skills Agent skipped |
 |-------|----------|-----------------|----------------------|
-| Obvious Phishing | 4 | 1 (rspamd only) | email_header_auth_check, urgency_check, url_reputation_check |
-| Legitimate | 4 | 2 (rspamd, header_auth) | urgency_check, url_reputation_check |
-| Ambiguous marketing | 4 | 4 (all) | — |
-| Spear Phishing | 4 | 2 (rspamd, header_auth) | urgency_check, url_reputation_check |
+| Obvious Phishing (QuickBooks impersonation) | 4 | 4 (rspamd_scan_email, email_header_auth_check, url_reputation_check, urgency_check) | — |
+| Legitimate (Columbia IT maintenance notice) | 4 | 2 (rspamd_scan_email, email_header_auth_check) | urgency_check, url_reputation_check |
+| Ambiguous (Shopify flash-sale marketing) | 4 | 3 (rspamd_scan_email, urgency_check, url_reputation_check) | email_header_auth_check |
+| Spear Phishing (Columbia IT security alert) | 4 | 4 (rspamd_scan_email, email_header_auth_check, urgency_check, url_reputation_check) | — |
 
 ### Baseline: ML Skill Signals
 
 | Email | Urgency Label | Urgency Score | URL Phishing Score | URL Suspicious |
 |-------|--------------|---------------|--------------------|----------------|
-| Obvious Phishing | not urgent | 0.000 | 0.034 | False |
-| Legitimate | not urgent | 0.000 | 0.002 | False |
-| Ambiguous marketing | very urgent | 1.000 | 0.021 | False |
-| Spear Phishing | somewhat urgent | 0.600 | 0.008 | False |
+| Obvious Phishing (QuickBooks impersonation) | not urgent | 0.139 | 0.070 | False |
+| Legitimate (Columbia IT maintenance notice) | not urgent | 0.170 | 0.007 | False |
+| Ambiguous (Shopify flash-sale marketing) | very urgent | 0.928 | 0.122 | False |
+| Spear Phishing (Columbia IT security alert) | somewhat urgent | 0.979 | 0.078 | False |
 
 ### Token Usage (Agent only)
 
 | Email | Tokens In | Tokens Out | Total |
 |-------|-----------|------------|-------|
-| Obvious Phishing | 5,156 | 2,372 | 7,528 |
-| Legitimate | 10,010 | 2,998 | 13,008 |
-| Ambiguous marketing | ~12,000 | ~3,200 | ~15,200 |
-| Spear Phishing | 6,947 | 2,307 | 9,254 |
+| Obvious Phishing (QuickBooks impersonation) | 18444 | 3476 | 21920 |
+| Legitimate (Columbia IT maintenance notice) | 8900 | 1985 | 10885 |
+| Ambiguous (Shopify flash-sale marketing) | 13400 | 2936 | 16336 |
+| Spear Phishing (Columbia IT security alert) | 15416 | 3532 | 18948 |

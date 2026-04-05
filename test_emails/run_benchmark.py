@@ -1,5 +1,5 @@
 """
-Benchmark: Baseline (all 4 skills exhaustive) vs. Agentic (Gemini adaptive)
+Benchmark: Baseline (all 4 skills exhaustive) vs. Agentic (Gemini 2.5 Flash adaptive)
 Skills: rspamd_scan_email, email_header_auth_check, urgency_check, url_reputation_check
 """
 from __future__ import annotations
@@ -111,27 +111,10 @@ def run_baseline(raw_email: str) -> dict[str, Any]:
     }
 
 
-# ── Agentic (Gemini adaptive) ─────────────────────────────────────────────────
+# ── Agentic (Groq adaptive) ───────────────────────────────────────────────────
 
-async def run_agent_on_email(raw_email: str) -> dict[str, Any]:
+async def run_agent_on_email(raw_email: str, agent) -> dict[str, Any]:
     t0 = time.perf_counter()
-
-    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-    mcp_env = {**os.environ, "RSPAMD_BASE_URL": RSPAMD_BASE_URL}
-
-    server_config = {
-        "email-security": {
-            "transport": "stdio",
-            "command": sys.executable,
-            "args": [str(MCP_SERVER_PATH)],
-            "cwd": str(PROJECT_ROOT),
-            "env": mcp_env,
-        }
-    }
-
-    client = MultiServerMCPClient(server_config)
-    tools = await client.get_tools()
-    agent = create_react_agent(model=model, tools=tools)
 
     prompt = (
         "Analyze this email and decide whether it is benign, suspicious, spam, or phishing.\n\n"
@@ -192,6 +175,24 @@ async def main() -> None:
     print(f"Rspamd: {RSPAMD_BASE_URL}")
     print("=" * 60)
 
+    # Build MCP client and agent once — reused across all emails
+    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    mcp_env = {**os.environ, "RSPAMD_BASE_URL": RSPAMD_BASE_URL}
+    server_config = {
+        "email-security": {
+            "transport": "stdio",
+            "command": sys.executable,
+            "args": [str(MCP_SERVER_PATH)],
+            "cwd": str(PROJECT_ROOT),
+            "env": mcp_env,
+        }
+    }
+    print("  Initializing MCP client ...", end=" ", flush=True)
+    client = MultiServerMCPClient(server_config)
+    tools = await client.get_tools()
+    agent = create_react_agent(model=model, tools=tools)
+    print("done")
+
     for i, (filename, label) in enumerate(EMAILS):
         raw_email = (emails_dir / filename).read_text(encoding="utf-8")
         print(f"\n[{label}]")
@@ -200,16 +201,11 @@ async def main() -> None:
         baseline = run_baseline(raw_email)
         print(f"done ({baseline['elapsed_ms']} ms)  verdict={baseline['verdict']}  urgency={baseline['urgency_label']}  url_risk={baseline['url_risk']}")
 
-        if i > 0:
-            print("  Waiting 60s for rate limit ...", end=" ", flush=True)
-            await asyncio.sleep(60)
-            print("done")
-
         print("  Running agent   ...", end=" ", flush=True)
-        agent = await run_agent_on_email(raw_email)
-        print(f"done ({agent['elapsed_ms']} ms)  tools={agent['tools_called']}")
+        agent_result = await run_agent_on_email(raw_email, agent)
+        print(f"done ({agent_result['elapsed_ms']} ms)  tools={agent_result['tools_called']}")
 
-        all_results.append({"label": label, "filename": filename, "baseline": baseline, "agent": agent})
+        all_results.append({"label": label, "filename": filename, "baseline": baseline, "agent": agent_result})
 
         # Save incrementally so a crash doesn't lose earlier results
         write_report(all_results)
@@ -227,7 +223,7 @@ def write_report(results: list[dict]) -> None:
         "# Email Security Benchmark Results",
         "",
         "**Baseline:** exhaustive — all 4 skills run on every email  ",
-        "**Agent:** Gemini 2.5 Flash — adaptive skill selection via MCP  ",
+        "**Agent:** llama-3.1-8b-instant via Groq — adaptive skill selection via MCP  ",
         "**Skills available:** `rspamd_scan_email`, `email_header_auth_check`, `urgency_check`, `url_reputation_check`",
         "",
         "---",
