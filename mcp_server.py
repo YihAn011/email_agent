@@ -8,18 +8,24 @@ from mcp.server.fastmcp import FastMCP
 
 from skills.header_auth.schemas import EmailHeaderAuthCheckInput
 from skills.header_auth.skill import EmailHeaderAuthCheckSkill
+from skills.error_patterns.schemas import ErrorPatternMemoryCheckInput, ListErrorPatternsInput
+from skills.error_patterns.skill import ErrorPatternMemoryCheckSkill, ListErrorPatternsSkill
 from skills.imap_monitor.schemas import (
     BindImapMailboxInput,
+    ListDecisionMemoryInput,
     ListRecentEmailResultsInput,
     PollMailboxInput,
+    RecordEmailCorrectionInput,
     ScanRecentImapEmailsInput,
 )
 from skills.imap_monitor.skill import (
     BindImapMailboxSkill,
     ImapMonitorStatusSkill,
+    ListDecisionMemorySkill,
     ListBoundImapMailboxesSkill,
     ListRecentEmailResultsSkill,
     PollImapMailboxesOnceSkill,
+    RecordEmailCorrectionSkill,
     ScanRecentImapEmailsSkill,
     SetupImapMonitorSkill,
     StartImapMonitorSkill,
@@ -53,9 +59,11 @@ mcp = FastMCP(
         "email_header_auth_check to quickly triage header authentication signals. "
         "Use urgency_check to score the urgency/pressure level of an email using a trained classifier. "
         "Use url_reputation_check to score URL/content phishing risk using a trained GradientBoosting model. "
+        "Use error_pattern_memory_check to consult known dataset-derived misclassification patterns before finalizing a verdict, "
+        "and list_error_patterns to inspect those stored patterns. "
         "Use list_bound_imap_mailboxes to discover already saved mailbox bindings before asking the user "
         "for credentials again. Use setup_imap_monitor or bind_imap_mailbox plus start_imap_monitor, poll_imap_mailboxes_once, "
-        "imap_monitor_status, list_recent_email_results, and scan_recent_imap_emails to manage "
+        "imap_monitor_status, list_recent_email_results, record_email_correction, list_decision_memory, and scan_recent_imap_emails to manage "
         "continuous mailbox monitoring over IMAP and inspect recent emails on demand."
     ),
 )
@@ -119,6 +127,45 @@ def email_header_auth_check(
     skill = EmailHeaderAuthCheckSkill()
     result = skill.run(payload)
     return result.model_dump()
+
+
+@mcp.tool(
+    name="error_pattern_memory_check",
+    description=(
+        "Check known dataset-derived misclassification patterns before finalizing an email verdict. "
+        "Useful when the current signals are ambiguous and you want to reduce repeated false positives or false negatives."
+    ),
+)
+def error_pattern_memory_check(
+    subject: str = "",
+    from_address: str = "",
+    current_verdict: str = "benign",
+    rspamd_risk_level: str | None = None,
+    header_risk_level: str | None = None,
+    urgency_label: str | None = None,
+    url_risk_level: str | None = None,
+) -> dict[str, Any]:
+    payload = ErrorPatternMemoryCheckInput(
+        subject=subject,
+        from_address=from_address,
+        current_verdict=current_verdict,
+        rspamd_risk_level=rspamd_risk_level,
+        header_risk_level=header_risk_level,
+        urgency_label=urgency_label,
+        url_risk_level=url_risk_level,
+    )
+    skill = ErrorPatternMemoryCheckSkill()
+    return skill.run(payload).model_dump()
+
+
+@mcp.tool(
+    name="list_error_patterns",
+    description="List stored dataset-derived error patterns that the memory layer can use before final email decisions.",
+)
+def list_error_patterns(limit: int = 20, pattern_type: str | None = None) -> dict[str, Any]:
+    payload = ListErrorPatternsInput(limit=limit, pattern_type=pattern_type)
+    skill = ListErrorPatternsSkill()
+    return skill.run(payload).model_dump()
 
 
 @mcp.tool(
@@ -249,6 +296,39 @@ def list_recent_email_results(
 ) -> dict[str, Any]:
     skill = ListRecentEmailResultsSkill()
     payload = ListRecentEmailResultsInput(email_address=email_address, limit=limit)
+    return skill.run(payload).model_dump()
+
+
+@mcp.tool(
+    name="record_email_correction",
+    description=(
+        "Store a correction pattern for a previously analyzed email. Use this when the user says the earlier verdict was wrong "
+        "and wants future similar emails handled better."
+    ),
+)
+def record_email_correction(
+    email_address: str,
+    uid: int,
+    corrected_verdict: str,
+    notes: str = "",
+) -> dict[str, Any]:
+    skill = RecordEmailCorrectionSkill()
+    payload = RecordEmailCorrectionInput(
+        email_address=email_address,
+        uid=uid,
+        corrected_verdict=corrected_verdict,
+        notes=notes,
+    )
+    return skill.run(payload).model_dump()
+
+
+@mcp.tool(
+    name="list_decision_memory",
+    description="List stored correction-memory patterns that can influence future final verdicts.",
+)
+def list_decision_memory(limit: int = 20) -> dict[str, Any]:
+    skill = ListDecisionMemorySkill()
+    payload = ListDecisionMemoryInput(limit=limit)
     return skill.run(payload).model_dump()
 
 

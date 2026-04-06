@@ -46,3 +46,15 @@ COMS6901-Dataset/data/
 # Trained model binaries — regenerate with train.py
 skills/urgency/model/*.pkl
 skills/url_reputation/model/
+
+# Local dataset pipeline artifacts
+dataset/__pycache__/
+dataset/logs/
+dataset/models/
+dataset/raw/
+dataset/processed/eval_chunks/
+dataset/processed/*.csv
+dataset/processed/*.jsonl
+dataset/processed/*.md
+dataset/reports/
+dataset/upstream_repo/

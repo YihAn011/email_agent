@@ -121,32 +121,8 @@ def run_baseline(raw_email: str) -> dict[str, Any]:
 
 # ── Agentic (adaptive LLM) ────────────────────────────────────────────────────
 
-async def run_agent_on_email(raw_email: str) -> dict[str, Any]:
+async def run_agent_on_email(raw_email: str, agent, provider: str, model_name: str) -> dict[str, Any]:
     t0 = time.perf_counter()
-
-    provider = resolve_provider()
-    model_name = resolve_default_model(provider)
-    model = build_chat_model(
-        provider=provider,
-        model_name=model_name,
-        temperature=0,
-        ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
-    )
-    mcp_env = build_mcp_env()
-
-    server_config = {
-        "email-security": {
-            "transport": "stdio",
-            "command": sys.executable,
-            "args": [str(MCP_SERVER_PATH)],
-            "cwd": str(PROJECT_ROOT),
-            "env": mcp_env,
-        }
-    }
-
-    client = MultiServerMCPClient(server_config)
-    tools = await client.get_tools()
-    agent = create_react_agent(model=model, tools=tools)
 
     prompt = (
         "Analyze this email and decide whether it is benign, suspicious, spam, or phishing.\n\n"
@@ -203,11 +179,35 @@ async def run_agent_on_email(raw_email: str) -> dict[str, Any]:
 async def main() -> None:
     emails_dir = Path(__file__).parent
     all_results = []
+    provider = resolve_provider()
+    model_name = resolve_default_model(provider)
 
     print("=" * 60)
     print("EMAIL SECURITY BENCHMARK  (4-skill pipeline)")
     print(f"Rspamd: {RSPAMD_BASE_URL}")
+    print(f"Model: {provider} / {model_name}")
     print("=" * 60)
+
+    model = build_chat_model(
+        provider=provider,
+        model_name=model_name,
+        temperature=0,
+        ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
+    )
+    server_config = {
+        "email-security": {
+            "transport": "stdio",
+            "command": sys.executable,
+            "args": [str(MCP_SERVER_PATH)],
+            "cwd": str(PROJECT_ROOT),
+            "env": build_mcp_env(),
+        }
+    }
+    print("  Initializing MCP client ...", end=" ", flush=True)
+    client = MultiServerMCPClient(server_config)
+    tools = await client.get_tools()
+    agent = create_react_agent(model=model, tools=tools)
+    print("done")
 
     for i, (filename, label) in enumerate(EMAILS):
         raw_email = (emails_dir / filename).read_text(encoding="utf-8")
@@ -217,16 +217,11 @@ async def main() -> None:
         baseline = run_baseline(raw_email)
         print(f"done ({baseline['elapsed_ms']} ms)  verdict={baseline['verdict']}  urgency={baseline['urgency_label']}  url_risk={baseline['url_risk']}")
 
-        if i > 0:
-            print("  Waiting 60s for rate limit ...", end=" ", flush=True)
-            await asyncio.sleep(60)
-            print("done")
-
         print("  Running agent   ...", end=" ", flush=True)
-        agent = await run_agent_on_email(raw_email)
-        print(f"done ({agent['elapsed_ms']} ms)  tools={agent['tools_called']}")
+        agent_result = await run_agent_on_email(raw_email, agent, provider, model_name)
+        print(f"done ({agent_result['elapsed_ms']} ms)  tools={agent_result['tools_called']}")
 
-        all_results.append({"label": label, "filename": filename, "baseline": baseline, "agent": agent})
+        all_results.append({"label": label, "filename": filename, "baseline": baseline, "agent": agent_result})
 
         # Save incrementally so a crash doesn't lose earlier results
         write_report(all_results)

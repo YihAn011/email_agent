@@ -14,36 +14,51 @@ from time import perf_counter
 from typing import Any
 
 from skills.base_skill import BaseSkill, SkillError, SkillMeta, SkillResult
+from skills.error_patterns.schemas import ErrorPatternMemoryCheckInput, ListErrorPatternsInput
+from skills.error_patterns.skill import ErrorPatternMemoryCheckSkill, ListErrorPatternsSkill
 from skills.header_auth.schemas import EmailHeaderAuthCheckInput
 from skills.header_auth.skill import EmailHeaderAuthCheckSkill
 from skills.rspamd.schemas import RspamdScanEmailInput
 from skills.rspamd.skill import RspamdScanEmailSkill
+from skills.urgency.schemas import UrgencyCheckInput
+from skills.urgency.skill import UrgencyCheckSkill
+from skills.url_reputation.schemas import UrlReputationInput
+from skills.url_reputation.skill import UrlReputationSkill
 
 from .schemas import (
     BindImapMailboxInput,
     BindImapMailboxResult,
     BoundMailbox,
+    DecisionMemoryEntry,
     ListRecentEmailResultsInput,
     ListRecentEmailResultsResult,
     ListBoundImapMailboxesResult,
+    ListDecisionMemoryInput,
+    ListDecisionMemoryResult,
     MonitorActionResult,
     MonitorStatusResult,
     PollMailboxInput,
     PollMailboxResult,
     PollMailboxSummary,
     RecentEmailResult,
+    RecordEmailCorrectionInput,
+    RecordEmailCorrectionResult,
     ScanRecentImapEmailsInput,
     ScanRecentImapEmailsResult,
     SetupImapMonitorResult,
 )
+from .memory import extract_domain, extract_keywords, find_memory_match, normalize_subject
 from .storage import (
     DB_PATH,
     LOG_PATH,
     PROJECT_ROOT,
     clear_pid,
     count_results,
+    get_email_result,
     get_mailbox,
+    insert_decision_memory,
     is_pid_running,
+    list_decision_memory,
     list_mailboxes,
     list_recent_results,
     recent_errors,
@@ -193,6 +208,109 @@ def _max_verdict(current: str, candidate: str) -> str:
     return candidate if _severity_rank(candidate) > _severity_rank(current) else current
 
 
+def _apply_memory_guidance(
+    *,
+    subject: str,
+    from_address: str,
+    current_verdict: str,
+    summary: str,
+) -> tuple[str, str | None, bool, str]:
+    match = find_memory_match(
+        subject=subject,
+        from_address=from_address,
+        current_verdict=current_verdict,
+    )
+    if match is None:
+        return current_verdict, None, False, summary
+
+    memory_hint = (
+        f"Matched a stored correction pattern ({match.reason}). "
+        f"A similar email was previously corrected from `{match.prior_verdict}` "
+        f"to `{match.corrected_verdict}`."
+    )
+    if match.notes:
+        memory_hint += f" Note: {match.notes}"
+
+    should_apply = current_verdict in {"benign", "suspicious"} and match.score >= 6
+    if should_apply and match.corrected_verdict != current_verdict:
+        return (
+            match.corrected_verdict,
+            memory_hint,
+            True,
+            f"{summary} | memory_override={current_verdict}->{match.corrected_verdict}",
+        )
+    return current_verdict, memory_hint, False, f"{summary} | memory_hint=matched"
+
+
+def _apply_error_pattern_guidance(
+    *,
+    subject: str,
+    from_address: str,
+    current_verdict: str,
+    rspamd_risk_level: str | None,
+    header_risk_level: str | None,
+    urgency_label: str | None,
+    url_risk_level: str | None,
+    summary: str,
+) -> tuple[str, str | None, bool, str]:
+    skill = ErrorPatternMemoryCheckSkill()
+    result = skill.run(
+        ErrorPatternMemoryCheckInput(
+            subject=subject,
+            from_address=from_address,
+            current_verdict=current_verdict,
+            rspamd_risk_level=rspamd_risk_level,
+            header_risk_level=header_risk_level,
+            urgency_label=urgency_label,
+            url_risk_level=url_risk_level,
+        )
+    )
+    if not result.ok or result.data is None or not result.data.matched:
+        return current_verdict, None, False, summary
+
+    suggested = result.data.suggested_verdict or current_verdict
+    hint = result.data.summary
+
+    should_apply = False
+    if current_verdict == "suspicious" and suggested == "benign":
+        should_apply = True
+    elif current_verdict == "benign" and suggested in {"suspicious", "phishing_or_spoofing"}:
+        should_apply = True
+
+    if should_apply and suggested != current_verdict:
+        return suggested, hint, True, f"{summary} | error_pattern_override={current_verdict}->{suggested}"
+    return current_verdict, hint, False, f"{summary} | error_pattern_hint=matched"
+
+
+def _load_error_pattern_context(summary: str) -> tuple[str | None, str]:
+    skill = ListErrorPatternsSkill()
+    result = skill.run(ListErrorPatternsInput(limit=20))
+    if not result.ok or result.data is None:
+        return None, summary
+
+    count = len(result.data.entries)
+    hint = f"Loaded {count} stored error patterns before finalizing the verdict."
+    return hint, f"{summary} | error_patterns_loaded={count}"
+
+
+def _build_memory_entry(record: dict[str, Any]) -> DecisionMemoryEntry:
+    return DecisionMemoryEntry(
+        id=int(record["id"]),
+        source_email_address=str(record["source_email_address"]),
+        source_uid=int(record["source_uid"]),
+        sender_domain=str(record["sender_domain"]),
+        subject_normalized=str(record["subject_normalized"]),
+        subject_keywords=[token for token in str(record["subject_keywords"]).split("|") if token],
+        prior_verdict=str(record["prior_verdict"]),
+        corrected_verdict=str(record["corrected_verdict"]),
+        notes=str(record.get("notes") or ""),
+        times_referenced=int(record.get("times_referenced") or 0),
+        last_referenced_utc=str(record["last_referenced_utc"]) if record.get("last_referenced_utc") else None,
+        created_at=str(record["created_at"]),
+        updated_at=str(record["updated_at"]),
+    )
+
+
 def _build_recent_result(record: dict[str, Any]) -> RecentEmailResult:
     return RecentEmailResult(
         email_address=str(record["email_address"]),
@@ -207,6 +325,8 @@ def _build_recent_result(record: dict[str, Any]) -> RecentEmailResult:
         final_verdict=str(record["final_verdict"]),
         summary=str(record["summary"]),
         raw_email_path=str(record["raw_email_path"]) if record.get("raw_email_path") else None,
+        memory_hint=str(record["memory_hint"]) if record.get("memory_hint") else None,
+        memory_applied=bool(record.get("memory_applied", False)),
     )
 
 
@@ -223,6 +343,8 @@ def _analyze_email_message(
 
     rspamd_skill = RspamdScanEmailSkill(base_url=rspamd_base_url or DEFAULT_RSPAMD_BASE_URL)
     header_skill = EmailHeaderAuthCheckSkill()
+    urgency_skill = UrgencyCheckSkill()
+    url_reputation_skill = UrlReputationSkill()
 
     rspamd_result = rspamd_skill.run(
         RspamdScanEmailInput(
@@ -236,7 +358,35 @@ def _analyze_email_message(
             include_raw_headers=False,
         )
     )
+    urgency_result = urgency_skill.run(
+        UrgencyCheckInput(
+            subject=str(parsed.get("Subject") or ""),
+            email_text=raw_email,
+        )
+    )
+    url_reputation_result = url_reputation_skill.run(
+        UrlReputationInput(
+            email_text=raw_email,
+        )
+    )
     final_verdict, summary = _compose_final_verdict(rspamd_result, header_result)
+    error_pattern_context_hint, summary = _load_error_pattern_context(summary)
+    final_verdict, error_pattern_hint, error_pattern_applied, summary = _apply_error_pattern_guidance(
+        subject=str(parsed.get("Subject") or ""),
+        from_address=str(parsed.get("From") or ""),
+        current_verdict=final_verdict,
+        rspamd_risk_level=rspamd_result.data.risk_level if rspamd_result.ok and rspamd_result.data else None,
+        header_risk_level=header_result.data.risk_level if header_result.ok and header_result.data else None,
+        urgency_label=urgency_result.data.urgency_label if urgency_result.ok and urgency_result.data else None,
+        url_risk_level=url_reputation_result.data.risk_level if url_reputation_result.ok and url_reputation_result.data else None,
+        summary=summary,
+    )
+    final_verdict, memory_hint, memory_applied, summary = _apply_memory_guidance(
+        subject=str(parsed.get("Subject") or ""),
+        from_address=str(parsed.get("From") or ""),
+        current_verdict=final_verdict,
+        summary=summary,
+    )
     analyzed_at_utc = utc_now_iso()
 
     record = {
@@ -252,6 +402,10 @@ def _analyze_email_message(
         "final_verdict": final_verdict,
         "summary": summary,
         "raw_email_path": raw_email_path,
+        "memory_hint": " | ".join(
+            hint for hint in (error_pattern_context_hint, error_pattern_hint, memory_hint) if hint
+        ) or None,
+        "memory_applied": error_pattern_applied or memory_applied,
     }
     insert_email_result(record)
     return _build_recent_result(record)
@@ -822,6 +976,105 @@ class ListRecentEmailResultsSkill(
             return SkillResult(
                 ok=False,
                 error=SkillError(type="list_results_error", message=str(exc), retryable=False),
+                meta=SkillMeta(
+                    skill_name=self.name,
+                    skill_version=self.version,
+                    latency_ms=latency_ms,
+                    timestamp_utc=timestamp_utc,
+                ),
+            )
+
+
+class RecordEmailCorrectionSkill(
+    BaseSkill[RecordEmailCorrectionInput, RecordEmailCorrectionResult]
+):
+    name = "record_email_correction"
+    description = "Store a correction pattern for a previously analyzed email."
+    version = "0.1.0"
+
+    def run(
+        self, payload: RecordEmailCorrectionInput
+    ) -> SkillResult[RecordEmailCorrectionResult]:
+        start = perf_counter()
+        timestamp_utc = utc_now_iso()
+        try:
+            row = get_email_result(payload.email_address, payload.uid)
+            if row is None:
+                raise RuntimeError(
+                    f"No analyzed email result found for {payload.email_address} uid={payload.uid}"
+                )
+
+            memory_row = insert_decision_memory(
+                {
+                    "source_email_address": payload.email_address,
+                    "source_uid": payload.uid,
+                    "sender_domain": extract_domain(str(row.get("from_address") or "")),
+                    "subject_normalized": normalize_subject(str(row.get("subject") or "")),
+                    "subject_keywords": "|".join(extract_keywords(str(row.get("subject") or ""))),
+                    "prior_verdict": str(row.get("final_verdict") or ""),
+                    "corrected_verdict": payload.corrected_verdict,
+                    "notes": payload.notes,
+                }
+            )
+            result = RecordEmailCorrectionResult(
+                memory_entry=_build_memory_entry(memory_row),
+                message=(
+                    "Stored a correction memory. Future similar emails can consult this "
+                    "pattern during the final decision step."
+                ),
+            )
+            latency_ms = int((perf_counter() - start) * 1000)
+            return SkillResult(
+                ok=True,
+                data=result,
+                meta=SkillMeta(
+                    skill_name=self.name,
+                    skill_version=self.version,
+                    latency_ms=latency_ms,
+                    timestamp_utc=timestamp_utc,
+                ),
+            )
+        except Exception as exc:
+            latency_ms = int((perf_counter() - start) * 1000)
+            return SkillResult(
+                ok=False,
+                error=SkillError(type="record_correction_error", message=str(exc), retryable=False),
+                meta=SkillMeta(
+                    skill_name=self.name,
+                    skill_version=self.version,
+                    latency_ms=latency_ms,
+                    timestamp_utc=timestamp_utc,
+                ),
+            )
+
+
+class ListDecisionMemorySkill(BaseSkill[ListDecisionMemoryInput, ListDecisionMemoryResult]):
+    name = "list_decision_memory"
+    description = "List stored correction-memory patterns."
+    version = "0.1.0"
+
+    def run(self, payload: ListDecisionMemoryInput) -> SkillResult[ListDecisionMemoryResult]:
+        start = perf_counter()
+        timestamp_utc = utc_now_iso()
+        try:
+            rows = list_decision_memory(payload.limit)
+            result = ListDecisionMemoryResult(entries=[_build_memory_entry(row) for row in rows])
+            latency_ms = int((perf_counter() - start) * 1000)
+            return SkillResult(
+                ok=True,
+                data=result,
+                meta=SkillMeta(
+                    skill_name=self.name,
+                    skill_version=self.version,
+                    latency_ms=latency_ms,
+                    timestamp_utc=timestamp_utc,
+                ),
+            )
+        except Exception as exc:
+            latency_ms = int((perf_counter() - start) * 1000)
+            return SkillResult(
+                ok=False,
+                error=SkillError(type="list_memory_error", message=str(exc), retryable=False),
                 meta=SkillMeta(
                     skill_name=self.name,
                     skill_version=self.version,

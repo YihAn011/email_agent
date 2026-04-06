@@ -35,6 +35,91 @@ def _compact(text: str, limit: int = 140) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+def _friendly_verdict(verdict: str | None) -> str:
+    mapping = {
+        "benign": "Looks safe",
+        "suspicious": "Needs caution",
+        "phishing_or_spoofing": "Likely phishing",
+        "error": "Could not finish the check",
+    }
+    return mapping.get((verdict or "").strip().lower(), verdict or "Unknown")
+
+
+def _friendly_risk(value: str | None) -> str:
+    mapping = {
+        "low": "low concern",
+        "medium": "some concern",
+        "high": "high concern",
+        "unknown": "unknown",
+        "n/a": "not checked",
+        "none": "none",
+    }
+    return mapping.get((value or "").strip().lower(), value or "unknown")
+
+
+def _parse_summary_flags(summary: str) -> dict[str, str]:
+    parts = [part.strip() for part in (summary or "").split("|") if part.strip()]
+    flags: dict[str, str] = {}
+    for part in parts:
+        if "=" in part:
+            key, value = part.split("=", 1)
+            flags[key.strip()] = value.strip()
+    return flags
+
+
+def _user_reason_lines(
+    *,
+    final_verdict: str | None,
+    rspamd_risk: str | None,
+    header_risk: str | None,
+    summary: str,
+) -> list[str]:
+    flags = _parse_summary_flags(summary)
+    reasons: list[str] = []
+
+    if final_verdict == "benign":
+        reasons.append("The system did not find strong signs of phishing or spam.")
+    elif final_verdict == "suspicious":
+        reasons.append("There were some warning signs, but not enough to call it phishing with high confidence.")
+    elif final_verdict == "phishing_or_spoofing":
+        reasons.append("Several signals point to impersonation or phishing behavior.")
+
+    if rspamd_risk == "low":
+        reasons.append("The content scanner saw only low-risk signals.")
+    elif rspamd_risk == "medium":
+        reasons.append("The content scanner found a few warning signs.")
+    elif rspamd_risk == "high":
+        reasons.append("The content scanner found strong warning signs.")
+
+    if header_risk == "low":
+        reasons.append("The sender and authentication details looked mostly normal.")
+    elif header_risk == "medium":
+        reasons.append("The sender or authentication details were a little unusual.")
+    elif header_risk == "high":
+        reasons.append("The sender or authentication details looked risky.")
+
+    if "error_pattern_override" in flags:
+        reasons.append(f"A remembered past mistake changed the final decision: {flags['error_pattern_override']}.")
+    elif "error_pattern_hint" in flags:
+        reasons.append("A remembered past mistake looked similar, so the system took an extra caution check.")
+
+    return reasons[:4]
+
+
+def _pattern_note(summary: str, memory_hint: str | None = None) -> str | None:
+    flags = _parse_summary_flags(summary)
+    if "error_pattern_override" in flags:
+        return f"Used a remembered pattern to change the decision: {flags['error_pattern_override']}."
+    if "error_pattern_hint" in flags:
+        return "A remembered pattern looked similar, but it did not change the final decision."
+    if "error_patterns_loaded" in flags:
+        count = flags["error_patterns_loaded"]
+        return f"Checked {count} remembered error patterns before deciding."
+    if memory_hint:
+        return memory_hint
+    return None
+
+
 def _classify_email_type(subject: str, from_address: str) -> str:
     subject_lc = (subject or "").lower()
     from_lc = (from_address or "").lower()
@@ -148,15 +233,29 @@ def _render_recent_scan(messages: list[BaseMessage], start_idx: int) -> str | No
                 f"{idx}. {item.get('subject') or '(no subject)'}",
                 f"From: {item.get('from_address') or 'unknown'}"
                 f"  ·  {_classify_email_type(str(item.get('subject') or ''), str(item.get('from_address') or ''))}",
-                f"Verdict: {item.get('final_verdict') or 'unknown'}",
-                f"Rspamd: {item.get('rspamd_risk_level') or 'unknown'}"
+                f"Decision: {_friendly_verdict(str(item.get('final_verdict') or 'unknown'))}",
+                f"Scanner result: {_friendly_risk(str(item.get('rspamd_risk_level') or 'unknown'))}"
                 + (
-                    f" ({item.get('rspamd_score')})"
+                    f" (score {item.get('rspamd_score')})"
                     if item.get("rspamd_score") is not None
                     else ""
                 ),
-                f"Header auth: {item.get('header_risk_level') or 'unknown'}",
-                f"Why: {item.get('summary') or 'no summary'}",
+                f"Sender check: {_friendly_risk(str(item.get('header_risk_level') or 'unknown'))}",
+                "Why this decision:",
+                *(
+                    f"- {line}"
+                    for line in _user_reason_lines(
+                        final_verdict=str(item.get("final_verdict") or ""),
+                        rspamd_risk=str(item.get("rspamd_risk_level") or ""),
+                        header_risk=str(item.get("header_risk_level") or ""),
+                        summary=str(item.get("summary") or ""),
+                    )
+                ),
+                (
+                    f"Pattern memory: {_pattern_note(str(item.get('summary') or ''), str(item.get('memory_hint') or ''))}"
+                    if _pattern_note(str(item.get("summary") or ""), str(item.get("memory_hint") or ""))
+                    else "Pattern memory: no similar past mistake was used."
+                ),
                 "",
             ]
         )
@@ -184,37 +283,47 @@ def _render_single_email_analysis(messages: list[BaseMessage], start_idx: int) -
         if isinstance(item, dict) and item.get("name"):
             symbol_names.append(str(item["name"]))
 
+    header_risk = header_data.get("risk_level", "n/a") if isinstance(header_data, dict) else "n/a"
+    summary = str(rspamd_data.get("summary") or "")
     lines = [
-        _section("Email Analysis"),
-        _kv("Verdict", rspamd_data.get("risk_level", "unknown")),
-        _kv("Action", rspamd_data.get("action", "unknown")),
-        _kv(
-            "Score",
-            f"{rspamd_data.get('score', 'unknown')}"
+        _section("Email Check"),
+        f"Decision: {_friendly_verdict(str(rspamd_data.get('risk_level', 'unknown')))}",
+        f"Scanner result: {_friendly_risk(str(rspamd_data.get('risk_level', 'unknown')))}",
+        f"Sender check: {_friendly_risk(str(header_risk))}",
+        "",
+        "Why this decision:",
+    ]
+    for line in _user_reason_lines(
+        final_verdict=str(rspamd_data.get("risk_level") or ""),
+        rspamd_risk=str(rspamd_data.get("risk_level") or ""),
+        header_risk=str(header_risk),
+        summary=summary,
+    ):
+        lines.append(f"- {line}")
+
+    if categories:
+        lines.append(f"- Main signal groups: {', '.join(str(item) for item in categories[:4])}")
+    if symbol_names:
+        lines.append(f"- Technical signals seen: {', '.join(symbol_names[:4])}")
+
+    lines.extend(
+        [
+            "",
+            "Technical details",
+            f"- Scanner action: {rspamd_data.get('action', 'unknown')}",
+            "- Scanner score: "
+            + f"{rspamd_data.get('score', 'unknown')}"
             + (
                 f" / {rspamd_data.get('required_score')}"
                 if rspamd_data.get("required_score") is not None
                 else ""
             ),
-        ),
-        _kv("Headers", header_data.get("risk_level", "n/a") if isinstance(header_data, dict) else "n/a"),
-    ]
-    if categories:
-        lines.append(_kv("Categories", ", ".join(str(item) for item in categories[:5])))
-    if symbol_names:
-        lines.append(_kv("Signals", ", ".join(symbol_names)))
-    summary = rspamd_data.get("summary")
-    if isinstance(summary, str) and summary.strip():
-        lines.extend(["", "Summary", _compact(summary, limit=220)])
+        ]
+    )
 
-    if isinstance(header_data, dict):
-        findings = header_data.get("findings") or []
-        finding_types = []
-        for item in findings[:4]:
-            if isinstance(item, dict) and item.get("type"):
-                finding_types.append(str(item["type"]))
-        if finding_types:
-            lines.extend(["", "Header Findings", ", ".join(finding_types)])
+    note = _pattern_note(summary)
+    if note:
+        lines.extend(["", f"Pattern memory: {note}"])
 
     tool_list = summarize_invoked_tools(messages, start_idx)
     if tool_list:
@@ -263,8 +372,22 @@ def _render_recent_results(messages: list[BaseMessage], start_idx: int) -> str |
                 f"{idx}. {item.get('subject') or '(no subject)'}",
                 f"From: {item.get('from_address') or 'unknown'}"
                 f"  ·  {_classify_email_type(str(item.get('subject') or ''), str(item.get('from_address') or ''))}",
-                f"Verdict: {item.get('final_verdict') or 'unknown'}",
-                f"Why: {_compact(str(item.get('summary') or 'no summary'), 180)}",
+                f"Decision: {_friendly_verdict(str(item.get('final_verdict') or 'unknown'))}",
+                "Why this decision:",
+                *(
+                    f"- {line}"
+                    for line in _user_reason_lines(
+                        final_verdict=str(item.get("final_verdict") or ""),
+                        rspamd_risk=str(item.get("rspamd_risk_level") or ""),
+                        header_risk=str(item.get("header_risk_level") or ""),
+                        summary=str(item.get("summary") or ""),
+                    )
+                ),
+                (
+                    f"Pattern memory: {_pattern_note(str(item.get('summary') or ''), str(item.get('memory_hint') or ''))}"
+                    if _pattern_note(str(item.get("summary") or ""), str(item.get("memory_hint") or ""))
+                    else "Pattern memory: no similar past mistake was used."
+                ),
                 "",
             ]
         )

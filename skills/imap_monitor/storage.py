@@ -72,11 +72,37 @@ def _init_db(conn: sqlite3.Connection) -> None:
             header_risk_level TEXT,
             final_verdict TEXT NOT NULL,
             summary TEXT NOT NULL,
+            memory_hint TEXT,
+            memory_applied INTEGER NOT NULL DEFAULT 0,
             raw_email_path TEXT,
             UNIQUE(email_address, uid)
         );
+
+        CREATE TABLE IF NOT EXISTS decision_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_email_address TEXT NOT NULL,
+            source_uid INTEGER NOT NULL,
+            sender_domain TEXT NOT NULL,
+            subject_normalized TEXT NOT NULL,
+            subject_keywords TEXT NOT NULL,
+            prior_verdict TEXT NOT NULL,
+            corrected_verdict TEXT NOT NULL,
+            notes TEXT NOT NULL,
+            times_referenced INTEGER NOT NULL DEFAULT 0,
+            last_referenced_utc TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
     )
+    existing_email_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(email_results)").fetchall()
+    }
+    if "memory_hint" not in existing_email_columns:
+        conn.execute("ALTER TABLE email_results ADD COLUMN memory_hint TEXT")
+    if "memory_applied" not in existing_email_columns:
+        conn.execute("ALTER TABLE email_results ADD COLUMN memory_applied INTEGER NOT NULL DEFAULT 0")
     conn.commit()
 
 
@@ -184,8 +210,8 @@ def insert_email_result(record: dict[str, Any]) -> None:
             INSERT OR REPLACE INTO email_results (
                 email_address, uid, message_id, subject, from_address,
                 analyzed_at_utc, rspamd_risk_level, rspamd_score, header_risk_level,
-                final_verdict, summary, raw_email_path
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                final_verdict, summary, memory_hint, memory_applied, raw_email_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record["email_address"],
@@ -199,6 +225,8 @@ def insert_email_result(record: dict[str, Any]) -> None:
                 record.get("header_risk_level"),
                 record["final_verdict"],
                 record["summary"],
+                record.get("memory_hint"),
+                int(bool(record.get("memory_applied", False))),
                 record.get("raw_email_path"),
             ),
         )
@@ -216,6 +244,79 @@ def list_recent_results(limit: int, email_address: str | None = None) -> list[di
     with get_connection() as conn:
         rows = conn.execute(query, tuple(params)).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_email_result(email_address: str, uid: int) -> dict[str, Any] | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM email_results
+            WHERE email_address = ? AND uid = ?
+            """,
+            (email_address, uid),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def insert_decision_memory(entry: dict[str, Any]) -> dict[str, Any]:
+    now = utc_now_iso()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO decision_memory (
+                source_email_address, source_uid, sender_domain, subject_normalized,
+                subject_keywords, prior_verdict, corrected_verdict, notes,
+                times_referenced, last_referenced_utc, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entry["source_email_address"],
+                entry["source_uid"],
+                entry["sender_domain"],
+                entry["subject_normalized"],
+                entry["subject_keywords"],
+                entry["prior_verdict"],
+                entry["corrected_verdict"],
+                entry.get("notes", ""),
+                int(entry.get("times_referenced", 0)),
+                entry.get("last_referenced_utc"),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        row_id = conn.execute("SELECT last_insert_rowid() AS row_id").fetchone()["row_id"]
+        row = conn.execute("SELECT * FROM decision_memory WHERE id = ?", (row_id,)).fetchone()
+    return dict(row) if row else {}
+
+
+def list_decision_memory(limit: int = 20) -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM decision_memory
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def mark_memory_referenced(memory_id: int) -> None:
+    now = utc_now_iso()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE decision_memory
+            SET times_referenced = times_referenced + 1,
+                last_referenced_utc = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, memory_id),
+        )
+        conn.commit()
 
 
 def count_results() -> int:
@@ -289,4 +390,3 @@ def is_pid_running(pid: int | None) -> bool:
         return True
     except OSError:
         return False
-

@@ -135,6 +135,8 @@ class RecentEmailResult(BaseModel):
     final_verdict: str
     summary: str
     raw_email_path: Optional[str] = None
+    memory_hint: Optional[str] = None
+    memory_applied: bool = False
 
 
 class ListRecentEmailResultsInput(BaseModel):
@@ -150,6 +152,50 @@ class ScanRecentImapEmailsResult(BaseModel):
     email_address: str
     scanned_count: int
     emails: list[RecentEmailResult] = Field(default_factory=list)
+
+
+class RecordEmailCorrectionInput(BaseModel):
+    email_address: str = Field(..., description="Mailbox email address for the analyzed email.")
+    uid: int = Field(..., ge=1, description="IMAP UID of the analyzed email to correct.")
+    corrected_verdict: str = Field(
+        ...,
+        description="Corrected verdict to remember. Use values like benign, suspicious, spam, or phishing_or_spoofing.",
+    )
+    notes: str = Field(default="", description="Optional note describing why the prior decision was wrong.")
+
+    @field_validator("email_address", "corrected_verdict", "notes")
+    @classmethod
+    def validate_record_fields(cls, value: str) -> str:
+        return value.strip()
+
+
+class DecisionMemoryEntry(BaseModel):
+    id: int
+    source_email_address: str
+    source_uid: int
+    sender_domain: str
+    subject_normalized: str
+    subject_keywords: list[str] = Field(default_factory=list)
+    prior_verdict: str
+    corrected_verdict: str
+    notes: str = ""
+    times_referenced: int = 0
+    last_referenced_utc: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class RecordEmailCorrectionResult(BaseModel):
+    memory_entry: DecisionMemoryEntry
+    message: str
+
+
+class ListDecisionMemoryInput(BaseModel):
+    limit: int = Field(default=20, ge=1, le=100, description="Maximum number of memory patterns to return.")
+
+
+class ListDecisionMemoryResult(BaseModel):
+    entries: list[DecisionMemoryEntry] = Field(default_factory=list)
 
 
 SetupImapMonitorResult.model_rebuild()

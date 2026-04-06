@@ -9,7 +9,7 @@ DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 
 
 def resolve_provider(explicit_provider: str | None = None) -> str:
-    provider = (explicit_provider or os.getenv("LLM_PROVIDER") or "ollama").strip().lower()
+    provider = (explicit_provider or os.getenv("LLM_PROVIDER") or "gemini").strip().lower()
     if provider not in {"ollama", "gemini"}:
         raise ValueError(
             f"Unsupported provider '{provider}'. Expected 'ollama' or 'gemini'."

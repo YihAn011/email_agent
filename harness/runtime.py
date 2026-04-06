@@ -85,6 +85,18 @@ def summarize_tool_message(message: ToolMessage) -> str:
         items = data.get("results")
         if isinstance(items, list):
             return f"- `list_recent_email_results`: returned {len(items)} stored results"
+    if message.name == "record_email_correction" and isinstance(data, dict):
+        return f"- `record_email_correction`: stored a correction pattern for future similar emails"
+    if message.name == "list_decision_memory" and isinstance(data, dict):
+        items = data.get("entries")
+        if isinstance(items, list):
+            return f"- `list_decision_memory`: returned {len(items)} correction patterns"
+    if message.name == "error_pattern_memory_check" and isinstance(data, dict):
+        return f"- `error_pattern_memory_check`: matched={data.get('matched')} suggested={data.get('suggested_verdict')}"
+    if message.name == "list_error_patterns" and isinstance(data, dict):
+        items = data.get("entries")
+        if isinstance(items, list):
+            return f"- `list_error_patterns`: returned {len(items)} stored error patterns"
     if message.name == "imap_monitor_status" and isinstance(data, dict):
         return (
             f"- `imap_monitor_status`: running={data.get('running')} "
@@ -195,6 +207,25 @@ def describe_progress_message(message: BaseMessage) -> list[str]:
                     f"{progress_label_for_tool(message.name, phase='done')}: "
                     f"loaded {len(items)} stored email results"
                 ]
+            if message.name == "record_email_correction" and isinstance(data, dict):
+                return [f"{progress_label_for_tool(message.name, phase='done')}: future similar emails can use it"]
+            if message.name == "list_decision_memory" and isinstance(data, dict):
+                items = data.get("entries") or []
+                return [
+                    f"{progress_label_for_tool(message.name, phase='done')}: "
+                    f"loaded {len(items)} correction patterns"
+                ]
+            if message.name == "error_pattern_memory_check" and isinstance(data, dict):
+                return [
+                    f"{progress_label_for_tool(message.name, phase='done')}: "
+                    f"matched={data.get('matched')} suggested={data.get('suggested_verdict')}"
+                ]
+            if message.name == "list_error_patterns" and isinstance(data, dict):
+                items = data.get("entries") or []
+                return [
+                    f"{progress_label_for_tool(message.name, phase='done')}: "
+                    f"loaded {len(items)} error patterns"
+                ]
         return [progress_label_for_tool(message.name or "tool", phase="done")]
 
     return []
@@ -211,6 +242,10 @@ def progress_label_for_tool(tool_name: str, *, phase: str) -> str:
             "imap_monitor_status": "Checking monitor status",
             "poll_imap_mailboxes_once": "Checking for new mailbox messages",
             "list_recent_email_results": "Loading recent mailbox scan results",
+            "record_email_correction": "Saving a correction pattern",
+            "list_decision_memory": "Loading stored correction patterns",
+            "error_pattern_memory_check": "Checking known error patterns",
+            "list_error_patterns": "Loading stored error patterns",
             "scan_recent_imap_emails": "Scanning recent mailbox emails",
             "rspamd_scan_email": "Running email security scan",
             "email_header_auth_check": "Checking email authentication headers",
@@ -226,6 +261,10 @@ def progress_label_for_tool(tool_name: str, *, phase: str) -> str:
             "imap_monitor_status": "Monitor status loaded",
             "poll_imap_mailboxes_once": "Mailbox poll complete",
             "list_recent_email_results": "Recent results loaded",
+            "record_email_correction": "Correction pattern saved",
+            "list_decision_memory": "Stored correction patterns loaded",
+            "error_pattern_memory_check": "Error pattern check complete",
+            "list_error_patterns": "Stored error patterns loaded",
             "scan_recent_imap_emails": "Recent email scan complete",
             "rspamd_scan_email": "Email security scan complete",
             "email_header_auth_check": "Authentication header check complete",
@@ -241,6 +280,10 @@ def progress_label_for_tool(tool_name: str, *, phase: str) -> str:
             "imap_monitor_status": "Monitor status check failed",
             "poll_imap_mailboxes_once": "Mailbox poll failed",
             "list_recent_email_results": "Loading recent results failed",
+            "record_email_correction": "Saving the correction pattern failed",
+            "list_decision_memory": "Loading stored correction patterns failed",
+            "error_pattern_memory_check": "Checking known error patterns failed",
+            "list_error_patterns": "Loading stored error patterns failed",
             "scan_recent_imap_emails": "Recent email scan failed",
             "rspamd_scan_email": "Email security scan failed",
             "email_header_auth_check": "Authentication header check failed",
@@ -294,9 +337,16 @@ class _BaseRuntime:
 
     def routed_hint(self, prompt: str, limit: int = 3) -> str:
         matches = self.router.route(prompt, limit=limit)
-        if not matches:
+        names: list[str] = []
+        lowered = prompt.lower()
+        if any(token in lowered for token in ("email", "mailbox", "headers", "phishing", "spam", "verdict")):
+            names.extend(["list_error_patterns", "error_pattern_memory_check"])
+        for item in matches:
+            if item.name not in names:
+                names.append(item.name)
+        if not names:
             return ""
-        rendered = ", ".join(item.name for item in matches)
+        rendered = ", ".join(names[: max(limit + 2, len(names))])
         return f"Routing hints: {rendered}"
 
 

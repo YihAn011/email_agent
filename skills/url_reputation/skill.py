@@ -20,6 +20,8 @@ IP_RE = re.compile(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}')
 def _load() -> tuple:
     if _cache:
         return _cache["clf"], _cache["meta"]
+    if not (MODEL_DIR / "model.pkl").exists() or not (MODEL_DIR / "meta.pkl").exists():
+        return None, None
     clf = pickle.load(open(MODEL_DIR / "model.pkl", "rb"))
     meta = pickle.load(open(MODEL_DIR / "meta.pkl", "rb"))
     _cache.update({"clf": clf, "meta": meta})
@@ -64,12 +66,22 @@ class UrlReputationSkill(BaseSkill[UrlReputationInput, UrlReputationResult]):
 
         try:
             clf, meta = _load()
-            threshold = meta["phishing_threshold"]
-            feature_names = meta["features"]
-
             features, urls = _extract_features(payload)
-            X = [[features[f] for f in feature_names]]
-            score = float(clf.predict_proba(X)[0][1])
+            if clf is None or meta is None:
+                score = min(
+                    1.0,
+                    features["num_urls"] * 0.08
+                    + features["has_ip_url"] * 0.35
+                    + features["url_subdom_max"] * 0.05
+                    + features["num_exclamation_marks"] * 0.01
+                    + features["has_attachments"] * 0.05,
+                )
+                threshold = 0.45
+            else:
+                threshold = meta["phishing_threshold"]
+                feature_names = meta["features"]
+                X = [[features[f] for f in feature_names]]
+                score = float(clf.predict_proba(X)[0][1])
             is_suspicious = score >= threshold
 
             if score >= 0.7:
@@ -84,6 +96,11 @@ class UrlReputationSkill(BaseSkill[UrlReputationInput, UrlReputationResult]):
                 f"Extracted {len(urls)} URL(s). "
                 f"Risk level: {risk_level}."
             )
+            if clf is None or meta is None:
+                summary = (
+                    "Fallback heuristic URL reputation scoring was used because the trained model files were not found. "
+                    + summary
+                )
 
             latency_ms = int((perf_counter() - start) * 1000)
             return SkillResult(

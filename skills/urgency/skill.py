@@ -10,16 +10,65 @@ from .schemas import UrgencyCheckInput, UrgencyCheckResult
 
 MODEL_DIR = Path(__file__).parent / "model"
 _cache: dict = {}
+URGENT_KEYWORDS = [
+    "urgent",
+    "immediately",
+    "asap",
+    "action required",
+    "verify",
+    "suspend",
+    "suspended",
+    "click now",
+    "last chance",
+    "important",
+    "attention",
+    "password expires",
+    "confirm",
+    "update now",
+    "limited time",
+    "security alert",
+    "unusual activity",
+    "act now",
+    "final notice",
+]
 
 
 def _load() -> tuple:
     if _cache:
         return _cache["vec"], _cache["clf"], _cache["meta"]
+    if not (MODEL_DIR / "vectorizer.pkl").exists() or not (MODEL_DIR / "model.pkl").exists() or not (MODEL_DIR / "meta.pkl").exists():
+        return None, None, None
     vec = pickle.load(open(MODEL_DIR / "vectorizer.pkl", "rb"))
     clf = pickle.load(open(MODEL_DIR / "model.pkl", "rb"))
     meta = pickle.load(open(MODEL_DIR / "meta.pkl", "rb"))
     _cache.update({"vec": vec, "clf": clf, "meta": meta})
     return vec, clf, meta
+
+
+def _heuristic_result(subject: str, email_text: str) -> UrgencyCheckResult:
+    combined = f"{subject} {email_text}".lower()
+    keyword_count = sum(1 for item in URGENT_KEYWORDS if item in combined)
+    exclam_count = combined.count("!")
+    score = min(1.0, keyword_count * 0.12 + exclam_count * 0.03)
+    if score >= 0.7:
+        label = "very urgent"
+        risk = "high"
+    elif score >= 0.35:
+        label = "somewhat urgent"
+        risk = "medium"
+    else:
+        label = "not urgent"
+        risk = "low"
+    return UrgencyCheckResult(
+        urgency_label=label,
+        urgency_score=round(score, 4),
+        is_urgent=score >= 0.35,
+        risk_contribution=risk,
+        summary=(
+            "Fallback heuristic urgency scoring was used because the trained model files were not found. "
+            f"Keyword_count={keyword_count}, exclamations={exclam_count}, score={score:.2f}."
+        ),
+    )
 
 
 class UrgencyCheckSkill(BaseSkill[UrgencyCheckInput, UrgencyCheckResult]):
@@ -36,6 +85,19 @@ class UrgencyCheckSkill(BaseSkill[UrgencyCheckInput, UrgencyCheckResult]):
 
         try:
             vec, clf, meta = _load()
+            if vec is None or clf is None or meta is None:
+                data = _heuristic_result(payload.subject, payload.email_text)
+                latency_ms = int((perf_counter() - start) * 1000)
+                return SkillResult(
+                    ok=True,
+                    data=data,
+                    meta=SkillMeta(
+                        skill_name=self.name,
+                        skill_version=self.version,
+                        latency_ms=latency_ms,
+                        timestamp_utc=timestamp_utc,
+                    ),
+                )
             threshold = meta["urgent_threshold"]
             label_map_inv = {v: k for k, v in meta["label_map"].items()}
 

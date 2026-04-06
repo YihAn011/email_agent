@@ -53,6 +53,11 @@ def build_system_prompt(persona: str) -> str:
         "Tool usage guidance:",
         *tool_usage_guidance(),
         "",
+        "Mandatory decision workflow for any email verdict:",
+        "- Before finalizing a verdict about a raw email, mailbox email, or recent-email scan, call `list_error_patterns` to load the currently remembered dataset-derived patterns.",
+        "- After you have a provisional verdict from the normal security tools, call `error_pattern_memory_check` with the current verdict and the observed risk labels.",
+        "- Incorporate the error-pattern result into the final verdict. Do not skip this step.",
+        "",
         "Response requirements:",
         "- Start with a concise verdict and confidence.",
         "- Separate tool evidence from your own inference.",
@@ -64,6 +69,7 @@ def build_system_prompt(persona: str) -> str:
                 "- When the user wants mailbox monitoring, behave like a helpful chatbot: explain what you are doing briefly, use the monitor tools, and confirm the current state in plain language.",
                 "- Prefer natural conversation. The slash commands are conveniences, not the only way to interact.",
                 "- If the user asks for judgment about recent mailbox emails, prefer scanning the requested latest emails on demand instead of only reading cached results.",
+                "- If the user says a past verdict was wrong, use the correction-memory tools to store that feedback so similar future emails can be handled better.",
             ]
         )
     return "\n".join(lines)
@@ -77,9 +83,17 @@ def build_analysis_prompt(
 ) -> str:
     sections = [question.strip()]
     if raw_email:
+        sections.append(
+            "Required workflow: first call `list_error_patterns`, then run the normal security tools, "
+            "then call `error_pattern_memory_check` before the final verdict."
+        )
         sections.append("Use the available MCP tools to analyze the following raw RFC822 email:")
         sections.append(raw_email)
     elif raw_headers:
+        sections.append(
+            "Required workflow: first call `list_error_patterns`, then run the normal security tools, "
+            "then call `error_pattern_memory_check` before the final verdict."
+        )
         sections.append("Use the available MCP tools to analyze the following raw email headers:")
         sections.append(raw_headers)
     return "\n\n".join(sections)
@@ -91,6 +105,10 @@ def build_single_turn_prompt(
     raw_headers: str | None,
 ) -> str:
     sections = [question.strip()]
+    sections.append(
+        "Required workflow: first call `list_error_patterns`, then run the normal security tools, "
+        "then call `error_pattern_memory_check` before the final verdict."
+    )
     if raw_email:
         sections.append("Use the available MCP tools to analyze the following raw RFC822 email:")
         sections.append(raw_email)
@@ -101,4 +119,3 @@ def build_single_turn_prompt(
         sections.append("Use the available MCP tools to analyze the following raw RFC822 email:")
         sections.append(DEFAULT_EMAIL)
     return "\n\n".join(sections)
-
