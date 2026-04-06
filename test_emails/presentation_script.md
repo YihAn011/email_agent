@@ -1,101 +1,88 @@
-# Presentation Script: Agentic vs. Baseline Email Security Pipeline
-### Spoken script — 5 slides (~9 minutes)
+# Presentation Script: Email Guardian — Modular, Context-Aware, Chatbot-Driven
+### Spoken script — 6 slides (~10 minutes)
 
 ---
 
-## Slide 1 — The Problem and the Two Approaches
+## Slide 1 — Where We Were
 
 **Spoken script:**
 
-Email threats are not uniform. An obvious phishing attempt and a sophisticated spear-phishing attack look completely different — and a system that treats them the same way will either waste resources or miss the subtle ones.
+This project is an Skill-based AI email classification agent with CLI integration in the form of a chatbot. We have a reusable skill library, an AI agent reasoning loop, IMAP inbox integration, and ML-based classification skills trained from the dataset provided in class.
 
-More importantly, in this system, a false positive is the disaster. Flagging a legitimate business email as phishing means it gets buried, blocked, or buried in a warning queue. The user misses something important. That is the failure mode we are most concerned about.
+The core architecture is built around a shared MCP tool surface. The agent reads the email, chooses which tools to call, and uses the tool outputs as evidence instead of hard-coded verdicts. That reasoning loop is the key innovation.
 
-We built two pipelines to test this directly.
+The system also supports live mailbox binding through IMAP, so it can monitor recent emails, scan incoming mail continuously, and report on the latest inbox activity.
 
-The **baseline** is exhaustive: every email is run through all four security skills unconditionally — rspamd content scanning, header authentication checking, an urgency classifier, and a URL reputation scorer. All four fire every time. It takes the outputs, combines them with fixed logic, and returns a verdict. No reasoning. No adaptation. Fast and deterministic.
+The trained skills include the rspamd scanner, header authentication checker, urgency classifier, and URL reputation scorer. These models were developed from the class dataset and provide the four primary signal channels for the agent.
 
-The **agentic pipeline** uses Gemini 2.5 Flash as the decision-maker. Gemini reads the email, picks a skill, observes the result, and decides: is this enough to commit, or do I need more evidence? It chains tools only when the signal is genuinely ambiguous.
-
-The research question is: does adaptive skill selection produce better verdicts? And what does it cost?
+This is the baseline capability set we start from, but the architecture is designed to grow beyond these core detectors.
 
 ---
 
-## Slide 2 — The Skill Library
+## Slide 2 — Context-Augmented Learning
 
 **Spoken script:**
 
-Before the results, a quick look at what each skill actually does — because the comparison only makes sense if you understand what each one contributes.
+The first new feature is memory-based context augmentation. The agent now keeps an error pattern file that stores past false positives and false negatives.
 
-`rspamd_scan_email` is the first-pass scanner. It submits the raw email to rspamd's `/checkv2` endpoint and returns a score against a required threshold, categorised signals like phishing indicators, SPF failures, and Bayesian spam scores, and a normalised risk level. It is fast and broad.
+Before finalizing a verdict, the agent loads that memory with prompts like `call list_error_patterns` and then verifies the current prediction with `call error_pattern_memory_check`. This is how the agent actively learns from context and previous history.
 
-`email_header_auth_check` is purely structural. It parses SPF, DKIM, DMARC, and ARC results from the headers, checks for domain mismatches across From, Reply-To, and Return-Path, and returns findings with severity levels. It doesn't read the body at all.
+That means the system is not just replaying static rules. It compares the current email against prior mistakes, adjusts its reasoning based on similar past cases, and uses a feedback loop to improve over time.
 
-`urgency_check` is trained. It runs a logistic regression — trained on 355,000 labelled emails — against TF-IDF features from the subject and body, and returns a continuous urgency score between zero and one. The model was trained to optimise specificity: it almost never flags a legitimate email as urgent. When it does fire, you can trust it.
-
-`url_reputation_check` is also trained — a gradient boosting classifier on pre-engineered URL features: count, length, subdomain depth, whether any URL uses a raw IP address. Same dataset, same specificity-first tuning. Low false positive rate by design.
-
-Together these four cover four orthogonal dimensions: content toxicity, sender authentication, psychological pressure, and link structure.
+This layer is model-agnostic: the memory and tool workflow work with any decision-maker, so the architecture can support different LLMs or reasoning engines without changing the underlying skill surface.
 
 ---
 
-## Slide 3 — Results: Verdict Quality
+## Slide 3 — New CLI Chatbot Interface
 
 **Spoken script:**
 
-We tested four emails chosen to stress-test the comparison: an obvious phishing attempt, a legitimate university IT notice, an ambiguous marketing email, and a targeted spear-phishing attack.
+The second new feature is a Claude-style terminal chatbot interface. Users can interact with the agent naturally, ask it to analyze emails, and receive explanations in conversational form.
 
-**Obvious phishing.** Both systems agreed: phishing, high confidence. The agent called only rspamd — scored 14.7 out of 15.0 — and stopped. No need to go further. The baseline ran all four skills, two of which added nothing new.
+The CLI supports routes: it matches user intent to capabilities and tools, so the agent can decide whether to scan a raw email, parse headers, bind an IMAP inbox, or report on recent monitored messages.
 
-**Legitimate email.** This is the key result. The baseline returned phishing — a false positive. Because its verdict logic trusts rspamd's output directly, and rspamd flagged it, the baseline got it wrong. The agent called rspamd, saw the contradiction with the header authentication check — SPF pass, DKIM pass, DMARC pass for columbia.edu — and reasoned that the rspamd result was inconsistent with the authenticated evidence. It correctly returned benign. The agent avoided the exact failure mode we care most about.
+Its outputs include concise verdicts, confidence levels, evidence summaries, and recommended next steps. It also exposes mailbox commands like `bind_imap_mailbox`, `start_imap_monitor`, `poll_imap_mailboxes_once`, `imap_monitor_status`, and `list_recent_email_results`.
 
-**Ambiguous marketing.** Here the agent called all four tools before committing. rspamd flagged high risk; header auth showed a domain mismatch but DMARC passed; urgency_check returned a score of 1.0 — maximum urgency; URL reputation came back low risk. Four conflicting signals. The agent returned "suspicious, moderate confidence" — not a definitive phishing verdict — which is the correct answer when the evidence genuinely conflicts. The baseline called it phishing regardless.
-
-**Spear phishing.** Both systems agreed: phishing. But the baseline now has a much richer evidence trail — the urgency classifier returned "somewhat urgent" with a score of 0.60, corroborating the triple authentication failure. That corroboration is what the new skills add to the baseline: independent confirmation from a completely different signal source.
-
-**The pattern:** the agent produces zero false positives, correctly grades uncertainty on the ambiguous case, and skips unnecessary skill calls on clear-cut cases.
+That means the inbox is now bindable: the agent can connect to a mailbox, maintain monitoring state, and answer questions about the newest messages rather than only analyzing one-off inputs.
 
 ---
 
-## Slide 4 — Results: Cost and Efficiency
+## Slide 4 — Model-Agnostic Architecture
 
 **Spoken script:**
 
-The agent's better verdicts come at a cost. Here are the numbers.
+The architecture is intentionally model-agnostic. The tool library, prompts, and reasoning loop are separate from the underlying language model.
 
-On **latency**, the baseline ran in 49 to 1,881 milliseconds. The 1,881-millisecond outlier on the obvious phishing case is because the urgency model was being loaded into memory for the first time — subsequent runs are 50 milliseconds. The agent took 8 to 64 seconds, driven entirely by Gemini API round trips.
+That means we can swap the decision engine without rewriting the skills. Whether the agent runs on Gemini, an open-source model, or a future provider, the same MCP tool surface and reasoning workflow remain the core.
 
-On **tool calls**, the agent adapted exactly as expected. For the obvious phishing case — score 14.7 out of 15.0, clear signal — one tool call and done. For the legitimate and spear-phishing emails — two tool calls each. For the ambiguous case — all four. The agent allocated reasoning effort proportional to how hard the email was to classify.
-
-On **token usage**, the ambiguous email was the most expensive at roughly 15,000 tokens total. The obvious phishing case cost only 7,500 — Gemini made its decision quickly and cheaply.
-
-The pattern is consistent: the agent spends more tokens and time exactly where the evidence is ambiguous. It is not uniformly expensive.
-
-| Email | Baseline ms | Agent ms | Agent tool calls | Agent tokens |
-|---|---|---|---|---|
-| Obvious phishing | ~50 | 8,476 | 1 | 7,528 |
-| Legitimate | 51 | 16,015 | 2 | 13,008 |
-| Ambiguous marketing | 49 | 64,183 | 4 | ~15,200 |
-| Spear phishing | 49 | 14,483 | 2 | 9,254 |
+The skill library is modular: each capability implements the same `BaseSkill` interface, exposing a consistent `run()` contract and `SkillResult` envelope. This makes it easy to add new detectors or memory tools while preserving the overall architecture.
 
 ---
 
-## Slide 5 — What This Means and What Comes Next
+## Slide 5 — Reasoning Loop Optimization
 
 **Spoken script:**
 
-The comparison surfaces a clear architectural insight.
+There is also an important runtime optimization in a branch named `benchmark-groq-mcp-fix`. That branch introduces a single persistent MCP client for the chat session using `MultiServerMCPClient`, and it constructs the agent with `create_react_agent`, rather than rebuilding the client or tool surface for every email interaction.
 
-The baseline is fast, cheap, and thorough — but it cannot reason. When two skills return contradictory signals, the baseline picks a winner by rule. That is why it produced a false positive on the legitimate email: rspamd said phishing, the rule followed rspamd, done. The header auth result that said the opposite was outweighed silently.
+In practice, this means the agent keeps one MCP connection alive and reuses the same tool registry across turns. That kind of optimization is exactly what can cut reasoning latency dramatically — the branch is designed to improve per-email speed by tens of seconds.
 
-The agent treats skill outputs as evidence rather than verdicts. It can say: these two signals conflict, one of them is more credible in this context, here is my reasoning. That is why it correctly overrode the false positive — and why it held back from a definitive verdict on the ambiguous case rather than committing to a wrong answer.
-
-The new ML skills — urgency and URL reputation — add something specific: **independent, quantified signals from orthogonal dimensions**. The urgency classifier caught that the Shopify email was maximally urgent, which pushed the agent to call more tools rather than stopping early. The URL reputation classifier corroborated the authentication failure on the spear-phishing case. Neither of these were available to the original two-skill system.
-
-What comes next is adding a semantic reasoning skill — an LLM phishing reasoner that reads the full email and provides a structured confidence score. With that in place, the agent's skill selection becomes the central research contribution: can it learn when to invoke the expensive LLM reasoner versus when the cheaper trained classifiers are sufficient? And does the baseline — running all four skills exhaustively — serve as the ground truth benchmark against which the agent's adaptive efficiency is measured?
-
-That is the experiment.
+If your screenshot confirms a 20–30 second improvement per email, this is the branch responsible: it is the one that moves the system from repeated setup to a unified MCP client runtime.
 
 ---
 
-*End of script. Estimated speaking time: ~9 minutes.*
+## Slide 6 — What This Means and What Comes Next
+
+**Spoken script:**
+
+The system has moved from a fixed comparison experiment to a flexible, extensible platform.
+
+It now combines trained ML detectors, IMAP mailbox monitoring, context-augmented error pattern memory, and a conversational chatbot interface. The reasoning loop is central: tools provide evidence, the agent evaluates that evidence, and memory helps the agent learn from past mistakes.
+
+The next step is adding a semantic phishing reasoner — a structured LLM skill that reads the full email and returns a confidence score. With that added, the architecture can decide when cheaper detectors are enough and when to invoke the more expensive semantic reasoning path.
+
+This makes the project less about a single benchmark and more about building a reusable email security reasoning platform.
+
+---
+
+*End of script. Estimated speaking time: ~10 minutes.*
