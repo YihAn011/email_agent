@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import email as stdlib_email
+import json
 import os
 import sys
 from pathlib import Path
@@ -151,7 +152,6 @@ async def api_stream(uid: int) -> StreamingResponse:
     raw_email = eml_path.read_text(encoding="utf-8", errors="replace")
 
     async def _event_stream() -> AsyncGenerator[str, None]:
-        import json
         async for event in stream_analysis(uid, email_address, raw_email):
             yield f"data: {json.dumps(event)}\n\n"
         yield 'data: {"type":"done"}\n\n'

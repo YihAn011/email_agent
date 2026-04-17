@@ -10,6 +10,7 @@ def test_status_returns_200():
     data = resp.json()
     assert "monitor_running" in data
     assert "result_count" in data
+    assert "bound_mailboxes" in data
 
 def test_emails_returns_list():
     resp = client.get("/api/emails")
