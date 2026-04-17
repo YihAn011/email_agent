@@ -87,7 +87,7 @@ def _events_from_new_messages(new_messages: list[BaseMessage]) -> list[dict]:
                 payload = json.loads(msg.content) if isinstance(msg.content, str) else {}
             except (json.JSONDecodeError, TypeError):
                 payload = {}
-            ok = isinstance(payload, dict) and bool(payload.get("ok", True))
+            ok = isinstance(payload, dict) and bool(payload.get("ok", False))
             events.append({
                 "type": "skill_complete",
                 "skill": msg.name or "unknown",
@@ -123,7 +123,7 @@ async def stream_analysis(
     from langchain_mcp_adapters.client import MultiServerMCPClient
     from langgraph.prebuilt import create_react_agent
     from examples.model_factory import build_chat_model, resolve_provider, resolve_default_model
-    from harness.prompts import build_single_turn_prompt
+    from harness.prompts import build_single_turn_prompt, build_system_prompt
 
     provider = resolve_provider(None)
     model_name = resolve_default_model(provider)
@@ -144,60 +144,60 @@ async def stream_analysis(
         }
     }
 
-    client = MultiServerMCPClient(server_config)
-    tools = await client.get_tools()
-    agent = create_react_agent(model=model, tools=tools)
+    async with MultiServerMCPClient(server_config) as client:
+        tools = await client.get_tools()
+        agent = create_react_agent(model=model, tools=tools)
 
-    prompt = build_single_turn_prompt(
-        "Analyze this email for security threats. Provide a verdict and confidence.",
-        raw_email=raw_email,
-        raw_headers=None,
-    )
+        prompt = build_single_turn_prompt(
+            "Analyze this email for security threats. Provide a verdict and confidence.",
+            raw_email=raw_email,
+            raw_headers=None,
+        )
 
-    messages = [
-        SystemMessage(content="You are an email security analyst."),
-        HumanMessage(content=prompt),
-    ]
-    start_ms = int(time.time() * 1000)
-    prev_count = 0
-    final_verdict = "suspicious"
-    final_text = ""
+        messages = [
+            SystemMessage(content=build_system_prompt()),
+            HumanMessage(content=prompt),
+        ]
+        start_ms = int(time.time() * 1000)
+        prev_count = 0
+        final_verdict = "suspicious"
+        final_text = ""
 
-    try:
-        async for state in agent.astream({"messages": messages}, stream_mode="values"):
-            if not isinstance(state, dict) or not isinstance(state.get("messages"), list):
-                continue
-            all_messages: list[BaseMessage] = state["messages"]
-            new_messages = all_messages[prev_count:]
-            prev_count = len(all_messages)
-            for event in _events_from_new_messages(new_messages):
-                if event["type"] == "reasoning_text":
-                    final_text = event["text"]
-                    final_verdict = _extract_verdict(final_text)
-                yield event
-    except Exception as exc:
-        yield {"type": "error", "message": str(exc), "retryable": False}
-        return
+        try:
+            async for state in agent.astream({"messages": messages}, stream_mode="values"):
+                if not isinstance(state, dict) or not isinstance(state.get("messages"), list):
+                    continue
+                all_messages: list[BaseMessage] = state["messages"]
+                new_messages = all_messages[prev_count:]
+                prev_count = len(all_messages)
+                for event in _events_from_new_messages(new_messages):
+                    if event["type"] == "reasoning_text":
+                        final_text = event["text"]
+                        final_verdict = _extract_verdict(final_text)
+                    yield event
+        except Exception as exc:
+            yield {"type": "error", "message": str(exc), "retryable": False}
+            return
 
-    elapsed_ms = int(time.time() * 1000) - start_ms
+        elapsed_ms = int(time.time() * 1000) - start_ms
 
-    try:
-        insert_email_result({
-            "email_address": email_address,
-            "uid": uid,
-            "subject": "",
-            "from_address": "",
-            "analyzed_at_utc": utc_now_iso(),
-            "final_verdict": final_verdict,
-            "summary": final_text[:500],
-        })
-    except Exception:
-        pass
+        try:
+            insert_email_result({
+                "email_address": email_address,
+                "uid": uid,
+                "subject": "",
+                "from_address": "",
+                "analyzed_at_utc": utc_now_iso(),
+                "final_verdict": final_verdict,
+                "summary": final_text[:500],
+            })
+        except Exception:
+            pass
 
-    yield {
-        "type": "agent_complete",
-        "verdict": final_verdict,
-        "summary": final_text,
-        "elapsed_ms": elapsed_ms,
-        "cached": False,
-    }
+        yield {
+            "type": "agent_complete",
+            "verdict": final_verdict,
+            "summary": final_text,
+            "elapsed_ms": elapsed_ms,
+            "cached": False,
+        }
