@@ -1,1 +1,183 @@
-<!DOCTYPE html><html><body><h1>Intelligent Mail</h1></body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Intelligent Mail</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0f172a; color: #94a3b8; font-family: 'Menlo', 'Monaco', 'Consolas', monospace; font-size: 13px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+    /* Top bar */
+    #topbar { background: #1e293b; border-bottom: 1px solid #0f172a; padding: 10px 18px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+    #topbar .brand { color: #7c3aed; font-weight: 700; font-size: 13px; letter-spacing: 1px; }
+    #topbar .account { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #64748b; }
+    #status-dot { width: 7px; height: 7px; border-radius: 50%; background: #475569; display: inline-block; }
+    #status-dot.connected { background: #22c55e; }
+
+    /* Split pane */
+    #split { display: flex; flex: 1; overflow: hidden; }
+
+    /* Inbox panel */
+    #inbox { width: 30%; border-right: 1px solid #1e293b; display: flex; flex-direction: column; overflow: hidden; }
+    #inbox-header { padding: 8px 12px; border-bottom: 1px solid #1e293b; font-size: 10px; color: #475569; letter-spacing: 1px; flex-shrink: 0; }
+    #inbox-list { flex: 1; overflow-y: auto; }
+    .email-row { padding: 9px 12px; border-left: 3px solid transparent; border-bottom: 1px solid #0f172a; cursor: pointer; }
+    .email-row:hover { background: #131f30; }
+    .email-row.selected { background: #1e1035; border-left-color: #7c3aed; }
+    .email-row .row-top { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 3px; gap: 6px; }
+    .email-row .subject { color: #e2e8f0; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+    .email-row .subject.unread { font-weight: 600; }
+    .email-row .sender { color: #334155; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .badge { border-radius: 2px; padding: 1px 5px; font-size: 9px; font-weight: 600; flex-shrink: 0; }
+    .badge-benign { background: #052e16; color: #4ade80; }
+    .badge-suspicious { background: #431407; color: #fb923c; }
+    .badge-phishing { background: #450a0a; color: #fca5a5; }
+    .badge-error { background: #1e293b; color: #64748b; }
+    .badge-none { background: #1e293b; color: #334155; }
+
+    /* Analysis panel */
+    #analysis { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+    #analysis-empty { flex: 1; display: flex; align-items: center; justify-content: center; color: #1e293b; font-size: 13px; }
+    #analysis-content { flex: 1; display: none; flex-direction: column; overflow: hidden; }
+    #analysis-content.visible { display: flex; }
+
+    /* Email header bar */
+    #email-header-bar { padding: 10px 16px; border-bottom: 1px solid #1e293b; flex-shrink: 0; background: #0f172a; }
+    #email-subject { color: #e2e8f0; font-size: 13px; font-weight: 600; margin-bottom: 3px; }
+    #email-meta { color: #475569; font-size: 10px; }
+
+    /* Scrollable analysis body */
+    #analysis-body { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+
+    /* Timeline */
+    #timeline { display: flex; flex-direction: column; gap: 0; }
+    .timeline-section-label { font-size: 9px; color: #475569; letter-spacing: 1px; margin-bottom: 8px; }
+    .skill-node { display: flex; gap: 10px; align-items: flex-start; }
+    .skill-node-connector { display: flex; flex-direction: column; align-items: center; flex-shrink: 0; }
+    .skill-dot { width: 18px; height: 18px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 9px; flex-shrink: 0; }
+    .skill-dot.pending { background: #0f172a; border: 2px solid #1e293b; }
+    .skill-dot.running { background: #0f172a; border: 2px solid #3b82f6; }
+    .skill-dot.running::after { content: ''; display: block; width: 6px; height: 6px; border-radius: 50%; background: #3b82f6; animation: pulse 1s infinite; }
+    .skill-dot.done-purple { background: #7c3aed; color: white; }
+    .skill-dot.done-green  { background: #16a34a; color: white; }
+    .skill-dot.done-amber  { background: #d97706; color: white; }
+    .skill-dot.done-red    { background: #dc2626; color: white; }
+    .skill-dot.done-slate  { background: #475569; color: white; }
+    .skill-dot.done-error  { background: #450a0a; border: 1px solid #dc2626; color: #fca5a5; }
+    .connector-line { width: 1px; height: 14px; background: #1e293b; }
+    .skill-card { flex: 1; border-radius: 4px; padding: 6px 10px; margin-bottom: 4px; border: 1px solid; }
+    .skill-card.pending { background: #0f172a; border-color: #1e293b; color: #334155; }
+    .skill-card.running { background: #0c1a2e; border-color: #1d4ed8; }
+    .skill-card.done { border-color: #1e293b; }
+    .skill-card.skill-rspamd.done    { background: #1d1040; border-color: #3b1d6e; }
+    .skill-card.skill-header.done    { background: #0b1f14; border-color: #14532d; }
+    .skill-card.skill-urgency.done   { background: #1c1a08; border-color: #5a3a00; }
+    .skill-card.skill-url.done       { background: #1a0c0c; border-color: #7f1d1d; }
+    .skill-card.skill-memory.done    { background: #0f172a; border-color: #334155; }
+    .skill-card .skill-name { font-size: 10px; font-weight: 600; margin-bottom: 2px; }
+    .skill-card .skill-result { font-size: 9px; color: #64748b; }
+    .skill-card.skill-rspamd .skill-name { color: #a78bfa; }
+    .skill-card.skill-header .skill-name { color: #4ade80; }
+    .skill-card.skill-urgency .skill-name { color: #fbbf24; }
+    .skill-card.skill-url .skill-name    { color: #f87171; }
+    .skill-card.skill-memory .skill-name { color: #94a3b8; }
+    .skill-card.running .skill-name { color: #93c5fd; }
+    .skill-card.pending .skill-name { color: #334155; }
+
+    /* Reasoning box */
+    #reasoning-box { background: #0c1220; border-left: 2px solid #334155; border-radius: 0 4px 4px 0; padding: 8px 10px; color: #64748b; font-size: 10px; line-height: 1.7; font-style: italic; display: none; white-space: pre-wrap; }
+    #reasoning-box.visible { display: block; }
+    #reasoning-cursor { display: inline-block; width: 1px; height: 11px; background: #94a3b8; vertical-align: text-bottom; animation: blink 1s step-end infinite; }
+
+    /* Verdict bar */
+    #verdict-bar { border-radius: 4px; padding: 8px 14px; display: none; align-items: center; justify-content: space-between; flex-shrink: 0; }
+    #verdict-bar.visible { display: flex; }
+    #verdict-bar.benign   { background: #052e16; border: 1px solid #16a34a; }
+    #verdict-bar.suspicious { background: #1c1917; border: 1px solid #78716c; }
+    #verdict-bar.phishing_or_spoofing { background: #450a0a; border: 1px solid #dc2626; }
+    #verdict-bar.error    { background: #1e293b; border: 1px solid #475569; }
+    #verdict-label { font-size: 11px; font-weight: 700; }
+    #verdict-bar.benign   #verdict-label { color: #4ade80; }
+    #verdict-bar.suspicious #verdict-label { color: #fb923c; }
+    #verdict-bar.phishing_or_spoofing #verdict-label { color: #fca5a5; }
+    #verdict-bar.error    #verdict-label { color: #64748b; }
+    #verdict-meta { font-size: 9px; color: #475569; }
+
+    /* Email body */
+    #body-section { display: none; }
+    #body-section.visible { display: block; }
+    #body-section-label { font-size: 9px; color: #475569; letter-spacing: 1px; margin-bottom: 6px; }
+    #body-wrapper { position: relative; background: #1e293b; border-radius: 4px; overflow: hidden; }
+    #body-content { padding: 12px; font-size: 10px; line-height: 1.7; color: #94a3b8; white-space: pre-wrap; max-height: 300px; overflow-y: auto; }
+    #body-content.blurred { filter: blur(4px); pointer-events: none; user-select: none; }
+    #body-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(15,23,42,0.7); }
+    #body-overlay.hidden { display: none; }
+    #reveal-btn { background: #374151; border: 1px solid #4b5563; border-radius: 3px; padding: 5px 14px; font-size: 10px; color: #d1d5db; cursor: pointer; font-family: inherit; }
+    #reveal-btn:hover { background: #4b5563; }
+    #body-overlay-label { font-size: 10px; color: #fca5a5; margin-bottom: 8px; text-align: center; }
+
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    @keyframes blink  { 50%{opacity:0} }
+  </style>
+</head>
+<body>
+
+  <div id="topbar">
+    <span class="brand">✦ INTELLIGENT MAIL</span>
+    <span class="account">
+      <span id="status-dot"></span>
+      <span id="account-label">not connected</span>
+    </span>
+  </div>
+
+  <div id="split">
+
+    <!-- Inbox -->
+    <div id="inbox">
+      <div id="inbox-header">INBOX</div>
+      <div id="inbox-list">
+        <div style="padding:16px;color:#334155;font-size:11px;">Loading…</div>
+      </div>
+    </div>
+
+    <!-- Analysis -->
+    <div id="analysis">
+      <div id="analysis-empty">Select an email to analyze</div>
+
+      <div id="analysis-content">
+        <div id="email-header-bar">
+          <div id="email-subject"></div>
+          <div id="email-meta"></div>
+        </div>
+
+        <div id="analysis-body">
+          <div id="timeline">
+            <div class="timeline-section-label">ANALYSIS</div>
+          </div>
+          <div id="reasoning-box"></div>
+          <div id="verdict-bar">
+            <span id="verdict-label"></span>
+            <span id="verdict-meta"></span>
+          </div>
+          <div id="body-section">
+            <div id="body-section-label">EMAIL BODY</div>
+            <div id="body-wrapper">
+              <div id="body-content"></div>
+              <div id="body-overlay" class="hidden">
+                <div>
+                  <div id="body-overlay-label"></div>
+                  <button id="reveal-btn">Show body anyway</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
