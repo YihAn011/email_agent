@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -70,7 +70,7 @@ def api_emails() -> list[dict]:
             "analyzed_at_utc": str(row.get("analyzed_at_utc", "")),
         }
 
-    all_emails: dict[tuple[str, int], dict] = dict(analyzed)
+    all_emails = analyzed
 
     mailboxes = list_mailboxes()
     for mailbox in mailboxes:
@@ -112,17 +112,22 @@ def api_email_raw(uid: int) -> dict:
             )
             body = ""
             if msg.is_multipart():
+                plain_body = ""
+                html_body = ""
                 for part in msg.walk():
                     ct = part.get_content_type()
                     if ct in ("text/plain", "text/html"):
                         try:
-                            body = part.get_payload(decode=True).decode(
+                            decoded = part.get_payload(decode=True).decode(
                                 part.get_content_charset() or "utf-8", errors="replace"
                             )
                             if ct == "text/plain":
-                                break
+                                plain_body = decoded
+                            else:
+                                html_body = decoded
                         except Exception:
                             pass
+                body = plain_body or html_body
             else:
                 try:
                     body = msg.get_payload(decode=True).decode(
@@ -144,9 +149,17 @@ async def api_stream(uid: int) -> StreamingResponse:
             yield 'data: {"type":"error","message":"No mailbox bound"}\n\n'
         return StreamingResponse(_no_mailbox(), media_type="text/event-stream")
 
-    email_address = str(mailboxes[0]["email_address"])
-    eml_path = MESSAGES_DIR / sanitize_mailbox_dir(email_address) / f"{uid}.eml"
-    if not eml_path.exists():
+    email_address = None
+    eml_path = None
+    for mailbox in mailboxes:
+        candidate_addr = str(mailbox["email_address"])
+        candidate_path = MESSAGES_DIR / sanitize_mailbox_dir(candidate_addr) / f"{uid}.eml"
+        if candidate_path.exists():
+            email_address = candidate_addr
+            eml_path = candidate_path
+            break
+
+    if eml_path is None:
         raise HTTPException(status_code=404, detail="Email file not found")
 
     raw_email = eml_path.read_text(encoding="utf-8", errors="replace")
@@ -165,5 +178,4 @@ async def api_stream(uid: int) -> StreamingResponse:
 
 @app.get("/")
 def index():
-    from fastapi.responses import FileResponse
     return FileResponse(str(STATIC_DIR / "index.html"))
