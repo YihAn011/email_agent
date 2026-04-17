@@ -39,6 +39,7 @@ def api_status() -> dict:
     return {
         "monitor_running": is_pid_running(pid),
         "bound_mailboxes": len(mailboxes),
+        "mailbox_addresses": [str(m["email_address"]) for m in mailboxes],
         "result_count": count_results(),
     }
 

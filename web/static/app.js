@@ -86,6 +86,9 @@ async function updateStatus() {
   const label = document.getElementById('account-label');
   dot.className = data.monitor_running ? 'connected' : '';
   label.textContent = data.monitor_running ? 'monitor running' : 'monitor stopped';
+  const addrs = data.mailbox_addresses || [];
+  const addrEl = document.getElementById('mailbox-address');
+  if (addrEl) addrEl.textContent = addrs.length ? addrs.join(', ') : '';
 }
 
 // ── email selection ──────────────────────────────────────────────────────────
