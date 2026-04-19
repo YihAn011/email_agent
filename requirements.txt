@@ -5,3 +5,4 @@ langgraph
 langchain-google-genai
 langchain-ollama
 langchain-mcp-adapters
+PySide6

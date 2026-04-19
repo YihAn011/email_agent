@@ -48,11 +48,30 @@ cd ~/Desktop/email_agent
 python chatbot.py
 ```
 
+Start the Ubuntu desktop pet UI:
+
+```bash
+cd ~/Desktop/email_agent
+source .venv/bin/activate
+pip install -r requirements.txt
+python desktop_pet.py
+```
+
+If Qt fails with an `xcb` platform plugin error on Ubuntu, install the missing
+system dependency and run it again:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libxcb-cursor0
+```
+
 Override the provider or model at runtime if needed:
 
 ```bash
 python chatbot.py --provider gemini --model gemini-2.5-flash
 python chatbot.py --provider ollama --model qwen3:latest
+python desktop_pet.py --provider gemini --model gemini-2.5-flash
+python desktop_pet.py --provider ollama --model qwen3:latest
 python examples/run_langgraph_gemini_agent.py --provider gemini --model gemini-2.5-flash
 python examples/run_langgraph_gemini_agent.py --provider ollama --model qwen3:latest
 ```
