@@ -5,6 +5,8 @@ import asyncio
 import html
 import os
 import re
+import signal
+import subprocess
 import sys
 from email import policy
 from email.parser import BytesParser
@@ -80,6 +82,57 @@ BALL_SIZE = 72
 PANEL_SIZE = QSize(1180, 680)
 DRAG_HOLD_MS = 250
 EMAIL_PAGE_SIZE = 10
+
+
+def _child_pids(parent: int) -> list[int]:
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-P", str(parent)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    out: list[int] = []
+    for token in proc.stdout.split():
+        if token.isdigit():
+            out.append(int(token))
+    return out
+
+
+def _gather_descendant_pids(root: int) -> list[int]:
+    """All descendant processes of root (post-order: deeper children first)."""
+    ordered: list[int] = []
+    for child in _child_pids(root):
+        ordered.extend(_gather_descendant_pids(child))
+        ordered.append(child)
+    return ordered
+
+
+def _sigterm_pid(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+def terminate_stack_child_pids_from_env() -> None:
+    """End mock rspamd / ollama started by scripts/start_full_stack.sh (sibling processes)."""
+    raw = os.environ.get("EMAIL_AGENT_STACK_CHILD_PIDS", "").strip()
+    if not raw:
+        return
+    for part in raw.replace(",", " ").split():
+        if part.isdigit():
+            _sigterm_pid(int(part))
+
+
+def terminate_own_subprocesses() -> None:
+    """End OS child processes of this interpreter (e.g. MCP stdio servers)."""
+    me = os.getpid()
+    for pid in reversed(_gather_descendant_pids(me)):
+        _sigterm_pid(pid)
 
 
 class ReadableHTMLParser(HTMLParser):
@@ -568,6 +621,7 @@ class PetWindow(QMainWindow):
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__()
         self.args = args
+        self._shutting_down = False
         self.runtime: EmailAgentRuntime | None = None
         self.thread: QThread | None = None
         self.worker: AgentWorker | None = None
@@ -724,6 +778,13 @@ class PetWindow(QMainWindow):
         help_button = QPushButton("Help")
         help_button.setObjectName("secondaryButton")
         help_button.clicked.connect(self.show_help)
+        quit_all_button = QPushButton("Quit and shut down all")
+        quit_all_button.setObjectName("dangerQuitButton")
+        quit_all_button.setToolTip(
+            "Close the window and terminate MCP child processes; "
+            "if launched via start_full_stack.sh, also stop mock Rspamd / Ollama."
+        )
+        quit_all_button.clicked.connect(self.confirm_quit_all)
 
         for button in (
             chat_view_button,
@@ -734,6 +795,7 @@ class PetWindow(QMainWindow):
             paste_headers_button,
             reset_button,
             help_button,
+            quit_all_button,
         ):
             side_layout.addWidget(button)
 
@@ -1015,6 +1077,12 @@ class PetWindow(QMainWindow):
             }
             #secondaryButton:hover {
                 background: #dbe3ea;
+            }
+            #dangerQuitButton {
+                background: #b91c1c;
+            }
+            #dangerQuitButton:hover {
+                background: #991b1b;
             }
             QCheckBox {
                 padding-left: 6px;
@@ -1580,13 +1648,59 @@ class PetWindow(QMainWindow):
         self.thread = None
         self.worker = None
 
-    def closeEvent(self, event) -> None:  # type: ignore[override]
+    def _drain_worker_threads(self, timeout_ms: int = 2500) -> None:
         if self.thread is not None:
             self.thread.quit()
-            self.thread.wait(1000)
+            self.thread.wait(timeout_ms)
         if self.mail_thread is not None:
             self.mail_thread.quit()
-            self.mail_thread.wait(1000)
+            self.mail_thread.wait(timeout_ms)
+
+    def _full_shutdown_cleanup(self) -> None:
+        self._drain_worker_threads(3000)
+        terminate_stack_child_pids_from_env()
+        terminate_own_subprocesses()
+
+    def confirm_quit_all(self) -> None:
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Confirm exit")
+        msg.setIcon(QMessageBox.Warning)
+        msg.setText("Quit Email Guardian?")
+        lines = [
+            "This closes the window and terminates child processes started by this app "
+            "(for example Python processes backing MCP tools).",
+        ]
+        if os.environ.get("EMAIL_AGENT_STACK_CHILD_PIDS", "").strip():
+            lines.append(
+                "Launch script PIDs were detected: exiting will also send SIGTERM to those "
+                "background services (mock Rspamd / ollama serve, etc.)."
+            )
+        else:
+            lines.append(
+                "No launch-script PIDs were registered. If you started Rspamd or Ollama separately, "
+                "stop those services yourself."
+            )
+        lines.append(
+            "This does not stop system-wide redis-server or rspamd services managed by systemd."
+        )
+        msg.setInformativeText("\n".join(lines))
+        yes_btn = msg.addButton("Quit and shut down all", QMessageBox.AcceptRole)
+        msg.addButton("Cancel", QMessageBox.RejectRole)
+        msg.exec()
+        if msg.clickedButton() != yes_btn:
+            return
+        self._shutting_down = True
+        self._full_shutdown_cleanup()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._shutting_down:
+            event.accept()
+            return
+        self._shutting_down = True
+        self._full_shutdown_cleanup()
         event.accept()
 
 
