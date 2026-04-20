@@ -62,11 +62,21 @@ from harness.runtime import (
     summarize_tool_messages,
 )
 from harness.ui import (
+    _friendly_email_type,
+    _required_decision_label,
     configure_quiet_logging,
     render_chat_response,
     render_error,
     render_trace,
 )
+from skills.error_patterns.schemas import ErrorPatternMemoryCheckInput, ListErrorPatternsInput
+from skills.error_patterns.skill import ErrorPatternMemoryCheckSkill, ListErrorPatternsSkill
+from skills.rspamd.schemas import RspamdScanEmailInput
+from skills.rspamd.skill import RspamdScanEmailSkill
+from skills.urgency.schemas import UrgencyCheckInput
+from skills.urgency.skill import UrgencyCheckSkill
+from skills.url_reputation.schemas import UrlReputationInput
+from skills.url_reputation.skill import UrlReputationSkill
 from skills.imap_monitor.schemas import BindImapMailboxInput
 from skills.imap_monitor.skill import (
     BindImapMailboxSkill,
@@ -230,7 +240,22 @@ def _compact_mail_text(text: str, limit: int = 360) -> str:
 
 
 def _html_escape_text(text: str) -> str:
-    return html.escape(text).replace("\n", "<br>")
+    rendered_lines: list[str] = []
+    for raw_line in text.splitlines():
+        escaped = html.escape(raw_line)
+        stripped = raw_line.strip()
+        if stripped.lower().startswith("verdict:"):
+            if "normal" in stripped.lower() or "benign" in stripped.lower():
+                color = "#15803d"
+            elif "phishing" in stripped.lower():
+                color = "#b91c1c"
+            elif "spam" in stripped.lower():
+                color = "#b45309"
+            else:
+                color = "#374151"
+            escaped = f'<span style="color:{color}; font-weight:bold;">{escaped}</span>'
+        rendered_lines.append(escaped)
+    return "<br>".join(rendered_lines)
 
 
 def _looks_like_html(text: str) -> bool:
@@ -306,56 +331,337 @@ def _mail_body_text(raw_bytes: bytes) -> str:
 def _message_preview(raw_bytes: bytes) -> dict[str, str]:
     parsed = BytesParser(policy=policy.default).parsebytes(raw_bytes)
     full_text = _mail_body_text(raw_bytes)
+    raw_email = raw_bytes.decode("utf-8", errors="replace")
     return {
         "subject": str(parsed.get("Subject") or "(no subject)"),
         "from": str(parsed.get("From") or "unknown"),
         "date": str(parsed.get("Date") or "unknown date"),
         "preview": _compact_mail_text(full_text, limit=160),
         "full_text": full_text or "(No readable plain text body.)",
+        "raw_email": raw_email,
     }
+
+
+def _fetch_raw_email_reference(email_address: str, uid_text: str) -> dict[str, str]:
+    if not email_address:
+        raise RuntimeError("Referenced email is missing its mailbox address")
+    if not uid_text:
+        raise RuntimeError("Referenced email is missing its IMAP UID")
+    mailbox = get_mailbox(email_address)
+    if mailbox is None:
+        raise RuntimeError(f"Mailbox {email_address} is not bound")
+
+    client = _connect_imap(mailbox)
+    try:
+        raw_bytes = _fetch_message_bytes(client, int(uid_text))
+        item = _message_preview(raw_bytes)
+        item["email_address"] = email_address
+        item["uid"] = str(uid_text)
+        return item
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            pass
+
+
+def resolve_referenced_email_originals(referenced_emails: list[dict[str, str]]) -> list[dict[str, str]]:
+    resolved: list[dict[str, str]] = []
+    for item in referenced_emails:
+        email_address = str(item.get("email_address") or "")
+        uid_text = str(item.get("uid") or "")
+        if email_address and uid_text:
+            resolved.append(_fetch_raw_email_reference(email_address, uid_text))
+            continue
+        if item.get("raw_email"):
+            resolved.append(item)
+            continue
+        raise RuntimeError(f"Referenced email {item.get('subject', '(no subject)')} cannot be fetched from IMAP")
+    return resolved
 
 
 def build_referenced_email_prompt(question: str, referenced_emails: list[dict[str, str]]) -> str:
     if len(referenced_emails) == 1:
         item = referenced_emails[0]
-        raw_email = "\n".join(
-            [
-                f"From: {item.get('from', 'unknown')}",
-                f"Date: {item.get('date', 'unknown date')}",
-                f"Subject: {item.get('subject', '(no subject)')}",
-                "",
-                str(item.get("full_text", "")),
-            ]
-        )
+        raw_email = str(item.get("raw_email") or "").strip()
+        if not raw_email:
+            raw_email = "\n".join(
+                [
+                    f"From: {item.get('from', 'unknown')}",
+                    f"Date: {item.get('date', 'unknown date')}",
+                    f"Subject: {item.get('subject', '(no subject)')}",
+                    "",
+                    str(item.get("full_text", "")),
+                ]
+            )
         return build_analysis_prompt(
             question
-            + "\nGive a final answer even if some tools are unavailable. Use plain language for a normal user.",
-            raw_email=raw_email,
+            + "\nMandatory: do not answer before using tools. First call list_error_patterns, then rspamd_scan_email with raw_email, url_reputation_check with email_text, urgency_check with email_text, then error_pattern_memory_check."
+            + "\nUse the short four-part template: Email, Type, Verdict, Evidence. "
+            "The Verdict line must be exactly one of Normal, Spam, Phishing. "
+            "Call rspamd_scan_email with raw_email equal to the complete raw RFC822 block; do not pass a summary, body-only text, JSON object, extracted fields, or email_text to rspamd_scan_email. "
+            "Use email_text only for url_reputation_check and urgency_check. "
+            "Before choosing Spam or Phishing, use multiple available checks, especially URL reputation, urgency, and error-pattern memory. "
+            "Use header authentication only if you can pass the complete raw RFC822 block as a string. "
+            "Do not use Rspamd score alone as the verdict. "
+            "Keep it brief unless the user asks for more detail.",
+            raw_email=f"BEGIN RAW RFC822\n{raw_email}\nEND RAW RFC822",
         )
 
     sections = [
         question,
+        "Mandatory: do not answer before using tools. First call list_error_patterns, then analyze each raw RFC822 email with rspamd_scan_email, url_reputation_check, urgency_check, and finally error_pattern_memory_check.",
         "There are multiple referenced emails below. Do not treat them as one combined email.",
         "Analyze each referenced email separately for phishing, spam, sender authenticity, urgency, and suspicious links.",
-        "Your final answer must contain one labeled section per email: Email 1, Email 2, Email 3 as applicable.",
-        "For each email, include verdict, confidence, key evidence, and recommended user action.",
+        "Your final answer must contain one short labeled section per email: Email 1, Email 2, Email 3 as applicable.",
+        "For each email, use exactly this template:",
+        "Email: <subject or short name>",
+        "Type: <business/school/recruiting/financial/account security/delivery/marketing/general notification/etc.>",
+        "Verdict: <Normal | Spam | Phishing>",
+        "Evidence:",
+        "- <called tool/skill name>: <one short evidence sentence>",
+        "- Inference: <one short sentence if needed>",
+        "The Verdict line must choose exactly one of Normal, Spam, Phishing.",
+        "Call rspamd_scan_email with raw_email equal to the complete raw RFC822 block; do not pass a summary, body-only text, JSON object, extracted fields, or email_text to rspamd_scan_email.",
+        "Use email_text only for url_reputation_check and urgency_check.",
+        "Before choosing Spam or Phishing, use multiple available checks, especially URL reputation, urgency, and error-pattern memory.",
+        "Use header authentication only if you can pass the complete raw RFC822 block as a string.",
+        "Do not use Rspamd score alone as the verdict.",
+        "Keep the answer brief. Do not write a long security report unless the user asks follow-up questions.",
+        "Only mention tools/skills that were actually called or are available locally.",
         "If tools are unavailable or only one tool runs, still provide a plain-language assessment for every referenced email from the visible content.",
         "",
         "Required workflow: first call `list_error_patterns`, then run the normal security tools where possible, then call `error_pattern_memory_check` before the final verdict.",
     ]
     for index, item in enumerate(referenced_emails, 1):
+        raw_email = str(item.get("raw_email") or "").strip()
+        if not raw_email:
+            raw_email = "\n".join(
+                [
+                    f"From: {item.get('from', 'unknown')}",
+                    f"Date: {item.get('date', 'unknown date')}",
+                    f"Subject: {item.get('subject', '(no subject)')}",
+                    "",
+                    str(item.get("full_text", "")),
+                ]
+            )
         sections.extend(
             [
                 "",
                 f"Referenced email {index}:",
-                f"From: {item.get('from', 'unknown')}",
-                f"Date: {item.get('date', 'unknown date')}",
-                f"Subject: {item.get('subject', '(no subject)')}",
-                "",
-                str(item.get("full_text", "")),
+                "BEGIN RAW RFC822",
+                raw_email,
+                "END RAW RFC822",
             ]
         )
     return "\n".join(sections)
+
+
+def _skill_error_text(name: str, result: Any) -> str:
+    error = getattr(result, "error", None)
+    message = getattr(error, "message", None) if error is not None else None
+    return f"{name} failed: {message or 'unknown error'}"
+
+
+def _looks_like_raw_email_input(text: str) -> bool:
+    lowered = text.lower()
+    has_header = bool(re.search(r"(?im)^(from|subject|date|to|return-path|message-id):\s+.", text))
+    has_body_marker = any(token in lowered for token in ("unsubscribe", "view in browser", "<html", "<table", "http://", "https://"))
+    return has_header and has_body_marker
+
+
+def _email_item_from_raw_text(raw_email: str) -> dict[str, str]:
+    parsed = BytesParser(policy=policy.default).parsebytes(raw_email.encode("utf-8", errors="replace"))
+    return {
+        "subject": str(parsed.get("Subject") or "(pasted email)"),
+        "from": str(parsed.get("From") or "unknown"),
+        "date": str(parsed.get("Date") or "unknown date"),
+        "full_text": _mail_body_text(raw_email.encode("utf-8", errors="replace")),
+        "raw_email": raw_email,
+    }
+
+
+def _obvious_phishing_reasons(raw_email: str, subject: str, from_address: str) -> list[str]:
+    text = f"{subject}\n{from_address}\n{raw_email}".lower()
+    reasons: list[str] = []
+    if "paypal" in text and not any(domain in from_address.lower() for domain in ("@paypal.com", ".paypal.com")):
+        reasons.append("PayPal branding is used from a non-PayPal sender domain.")
+    if "paypai" in text or "paypaı" in text or "paypa1" in text or "payi" in text or "paypaI".lower() in text:
+        reasons.append("The message uses a PayPal lookalike spelling or domain.")
+    if re.search(r"https?://[^\s\"'<>]*(?:\.tk|secure-verify|restore-account|urgent)", text):
+        reasons.append("The message contains a suspicious account-restore URL.")
+    if any(token in text for token in ("final warning", "permanent close", "permanently delete", "verify now", "2 hours", "120 minutes")):
+        reasons.append("The message uses urgent account-closure pressure.")
+    if "reply-to:" in text and "gmail.com" in text and "paypal" in text:
+        reasons.append("Reply-To points to a free-mail account while impersonating PayPal.")
+    return reasons[:4]
+
+
+def _direct_email_analysis(
+    email_items: list[dict[str, str]],
+    *,
+    rspamd_base_url: str,
+    progress: Any,
+) -> str:
+    rspamd_spam_threshold = 7.0
+    sections: list[str] = []
+    for index, item in enumerate(email_items, 1):
+        raw_email = str(item.get("raw_email") or "").strip()
+        subject = str(item.get("subject") or "(no subject)")
+        from_address = str(item.get("from") or "unknown")
+
+        if len(email_items) > 1:
+            progress.emit(f"Analyzing email {index}")
+
+        lines: list[str] = []
+        if len(email_items) > 1:
+            lines.append(f"Email {index}")
+        lines.extend(
+            [
+                f"Email: {subject}",
+                f"Type: {_friendly_email_type(subject, from_address)}",
+            ]
+        )
+
+        if not raw_email:
+            lines.extend(
+                [
+                    "Verdict: Normal",
+                    "Evidence:",
+                    "- IMAP: original raw RFC822 content was not available, so no scanner-backed spam or phishing evidence was found.",
+                    "",
+                    "Tools: none",
+                ]
+            )
+            sections.append("\n".join(lines))
+            continue
+
+        progress.emit("Running email security scan")
+        rspamd_result = RspamdScanEmailSkill(base_url=rspamd_base_url).run(
+            RspamdScanEmailInput(raw_email=raw_email, include_raw_result=True)
+        )
+        rspamd_data = rspamd_result.data.model_dump() if rspamd_result.ok and rspamd_result.data else {}
+        rspamd_score = float(rspamd_data.get("score") or 0.0)
+        obvious_phishing_reasons = _obvious_phishing_reasons(raw_email, subject, from_address)
+
+        if rspamd_result.ok and rspamd_score < rspamd_spam_threshold and not obvious_phishing_reasons:
+            lines.extend(
+                [
+                    "Verdict: Normal",
+                    "Evidence:",
+                    "- rspamd_scan_email: "
+                    + f"score={rspamd_score}, below spam threshold {rspamd_spam_threshold}; "
+                    + f"risk={rspamd_data.get('risk_level', 'unknown')}, action={rspamd_data.get('action', 'unknown')}.",
+                    "- Inference: Rspamd score is below the configured spam threshold, so no extra tools were needed.",
+                    "",
+                    "Tools: `rspamd_scan_email`",
+                ]
+            )
+            sections.append("\n".join(lines))
+            continue
+
+        body_text = _mail_body_text(raw_email.encode("utf-8", errors="replace")) or raw_email
+        if obvious_phishing_reasons:
+            progress.emit("Strong phishing indicators found; running additional checks")
+        else:
+            progress.emit("Rspamd score reached threshold; running additional checks")
+        progress.emit("Checking links and URL reputation")
+        url_result = UrlReputationSkill().run(UrlReputationInput(email_text=body_text, subject=subject))
+        progress.emit("Scoring urgency and pressure signals")
+        urgency_result = UrgencyCheckSkill().run(UrgencyCheckInput(email_text=body_text, subject=subject))
+        progress.emit("Loading stored error patterns")
+        patterns_result = ListErrorPatternsSkill().run(ListErrorPatternsInput(limit=20))
+
+        url_data = url_result.data.model_dump() if url_result.ok and url_result.data else {}
+        urgency_data = urgency_result.data.model_dump() if urgency_result.ok and urgency_result.data else {}
+        decision = "Phishing" if obvious_phishing_reasons else _required_decision_label(
+            rspamd_data,
+            None,
+            url_data,
+            urgency_data,
+            subject,
+            from_address,
+        )
+        current_verdict = "benign" if decision == "Normal" else "suspicious"
+
+        progress.emit("Checking known error patterns")
+        memory_result = ErrorPatternMemoryCheckSkill().run(
+            ErrorPatternMemoryCheckInput(
+                subject=subject,
+                from_address=from_address,
+                current_verdict=current_verdict,
+                rspamd_risk_level=str(rspamd_data.get("risk_level") or "") or None,
+                urgency_label=str(urgency_data.get("urgency_label") or "") or None,
+                url_risk_level=str(url_data.get("risk_level") or "") or None,
+            )
+        )
+        memory_data = memory_result.data.model_dump() if memory_result.ok and memory_result.data else {}
+        if not obvious_phishing_reasons and memory_data.get("matched") and memory_data.get("suggested_verdict") == "benign":
+            decision = "Normal"
+
+        lines.extend([f"Verdict: {decision}", "Evidence:"])
+        if rspamd_result.ok:
+            lines.append(
+                "- rspamd_scan_email: "
+                + f"risk={rspamd_data.get('risk_level', 'unknown')}, "
+                + f"score={rspamd_data.get('score', 'unknown')}, "
+                + f"action={rspamd_data.get('action', 'unknown')}; "
+                + (
+                    "strong phishing indicators triggered extra checks."
+                    if obvious_phishing_reasons and rspamd_score < rspamd_spam_threshold
+                    else f"score met threshold {rspamd_spam_threshold}, so extra checks were run."
+                )
+            )
+        else:
+            lines.append(f"- {_skill_error_text('rspamd_scan_email', rspamd_result)}")
+
+        if url_result.ok:
+            lines.append(
+                "- url_reputation_check: "
+                + f"risk={url_data.get('risk_level', 'unknown')}, "
+                + f"phishing_score={url_data.get('phishing_score', 'unknown')}."
+            )
+        else:
+            lines.append(f"- {_skill_error_text('url_reputation_check', url_result)}")
+
+        if urgency_result.ok:
+            lines.append(
+                "- urgency_check: "
+                + f"{urgency_data.get('urgency_label', 'unknown')}, "
+                + f"score={urgency_data.get('urgency_score', 'unknown')}."
+            )
+        else:
+            lines.append(f"- {_skill_error_text('urgency_check', urgency_result)}")
+
+        if memory_result.ok:
+            lines.append(
+                "- error_pattern_memory_check: "
+                + f"matched={memory_data.get('matched', False)}, "
+                + f"suggested={memory_data.get('suggested_verdict')}."
+            )
+        else:
+            lines.append(f"- {_skill_error_text('error_pattern_memory_check', memory_result)}")
+
+        if patterns_result.ok and patterns_result.data:
+            lines.append(f"- list_error_patterns: loaded {len(patterns_result.data.entries)} stored error patterns.")
+        for reason in obvious_phishing_reasons:
+            lines.append(f"- Heuristic: {reason}")
+
+        if decision == "Normal" and float(rspamd_data.get("score") or 0.0) >= 6:
+            lines.append("- Inference: Rspamd was not used alone as the verdict because URL and urgency checks did not corroborate Spam or Phishing.")
+
+        tools = [
+            "rspamd_scan_email",
+            "url_reputation_check",
+            "urgency_check",
+            "list_error_patterns",
+            "error_pattern_memory_check",
+        ]
+        lines.extend(["", "Tools: " + ", ".join(f"`{name}`" for name in tools)])
+        sections.append("\n".join(lines))
+
+    progress.emit("Preparing the final answer")
+    return "\n\n".join(sections)
 
 
 class AgentWorker(QObject):
@@ -378,6 +684,7 @@ class AgentWorker(QObject):
         runtime: EmailAgentRuntime | None,
         setup_only: bool = False,
         prefer_ai_response: bool = False,
+        direct_referenced_emails: list[dict[str, str]] | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -391,6 +698,7 @@ class AgentWorker(QObject):
         self.updated_runtime: EmailAgentRuntime | None = runtime
         self.setup_only = setup_only
         self.prefer_ai_response = prefer_ai_response
+        self.direct_referenced_emails = direct_referenced_emails
 
     def run(self) -> None:
         try:
@@ -401,6 +709,16 @@ class AgentWorker(QObject):
             self.finished.emit()
 
     async def _run(self) -> None:
+        if self.direct_referenced_emails is not None:
+            self.result.emit(
+                _direct_email_analysis(
+                    self.direct_referenced_emails,
+                    rspamd_base_url=self.rspamd_base_url,
+                    progress=self.progress,
+                )
+            )
+            return
+
         if self.runtime is None:
             self.progress.emit("Initializing Email Guardian runtime")
             self.runtime = EmailAgentRuntime(
@@ -529,6 +847,7 @@ class MailboxWorker(QObject):
             for uid in selected_uids:
                 raw_bytes = _fetch_message_bytes(client, uid)
                 item = _message_preview(raw_bytes)
+                item["email_address"] = self.email_address
                 item["uid"] = str(uid)
                 rows.append(item)
             self.emails_ready.emit(self.email_address, self.offset, rows)
@@ -1250,6 +1569,8 @@ class PetWindow(QMainWindow):
                     "from": str(data.get("from", "unknown")),
                     "date": str(data.get("date", "unknown date")),
                     "full_text": str(data.get("full_text", "")),
+                    "email_address": str(data.get("email_address", "")),
+                    "uid": str(data.get("uid", "")),
                 }
             )
         if not candidates:
@@ -1492,11 +1813,37 @@ class PetWindow(QMainWindow):
         self.input.clear()
         prompt_to_send = prompt
         prefer_ai_response = False
+        initial_progress: list[str] = []
+        direct_referenced_emails: list[dict[str, str]] | None = None
         if self.referenced_emails:
-            prompt_to_send = build_referenced_email_prompt(prompt, self.referenced_emails)
-            prefer_ai_response = True
+            try:
+                self.progress.clear()
+                self.set_progress_state("busy")
+                self.append_progress("Fetching original referenced email from IMAP by UID")
+                referenced_emails = resolve_referenced_email_originals(self.referenced_emails)
+                self.append_progress(f"Fetched {len(referenced_emails)} original email(s) from IMAP")
+                initial_progress = [
+                    "Fetching original referenced email from IMAP by UID",
+                    f"Fetched {len(referenced_emails)} original email(s) from IMAP",
+                ]
+            except Exception as exc:
+                QMessageBox.warning(self, "Could not fetch original email", str(exc))
+                return
+            prompt_to_send = build_referenced_email_prompt(prompt, referenced_emails)
+            prefer_ai_response = len(self.referenced_emails) > 1
+            direct_referenced_emails = referenced_emails
             self.clear_referenced_email()
-        self._run_agent(prompt_to_send, display_prompt=prompt, prefer_ai_response=prefer_ai_response)
+        elif _looks_like_raw_email_input(prompt):
+            direct_referenced_emails = [_email_item_from_raw_text(prompt)]
+            initial_progress = ["Using pasted email content as raw email input"]
+            prompt_to_send = build_referenced_email_prompt("Analyze the pasted email", direct_referenced_emails)
+        self._run_agent(
+            prompt_to_send,
+            display_prompt=prompt,
+            prefer_ai_response=prefer_ai_response,
+            initial_progress=initial_progress,
+            direct_referenced_emails=direct_referenced_emails,
+        )
 
     def run_sample(self) -> None:
         prompt = build_analysis_prompt(
@@ -1578,6 +1925,8 @@ class PetWindow(QMainWindow):
         setup_only: bool = False,
         display_prompt: str | None = None,
         prefer_ai_response: bool = False,
+        initial_progress: list[str] | None = None,
+        direct_referenced_emails: list[dict[str, str]] | None = None,
     ) -> None:
         if self.thread is not None:
             QMessageBox.information(self, "Busy", "Email Guardian is still working on the current request.")
@@ -1589,6 +1938,8 @@ class PetWindow(QMainWindow):
             self.append_chat_bubble("user", display_prompt if display_prompt is not None else prompt)
         self.progress.clear()
         self.set_progress_state("busy")
+        for line in initial_progress or []:
+            self.append_progress(line)
 
         self.thread = QThread()
         self.worker = AgentWorker(
@@ -1602,6 +1953,7 @@ class PetWindow(QMainWindow):
             runtime=self.runtime,
             setup_only=setup_only,
             prefer_ai_response=prefer_ai_response,
+            direct_referenced_emails=direct_referenced_emails,
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)

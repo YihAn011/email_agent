@@ -73,11 +73,13 @@ mcp = FastMCP(
     name="rspamd_scan_email",
     description=(
         "Scan an RFC822 raw email with rspamd /checkv2 and return normalized "
-        "security signals."
+        "security signals. Pass the complete raw email as raw_email. "
+        "email_text is accepted only as a compatibility alias."
     ),
 )
 def rspamd_scan_email(
-    raw_email: str,
+    raw_email: str | None = None,
+    email_text: str | None = None,
     mail_from: str | None = None,
     rcpt_to: list[str] | None = None,
     ip: str | None = None,
@@ -89,8 +91,9 @@ def rspamd_scan_email(
     base_url: str | None = None,
 ) -> dict[str, Any]:
     """MCP tool wrapper around the existing RspamdScanEmailSkill."""
+    resolved_raw_email = raw_email or email_text
     payload = RspamdScanEmailInput(
-        raw_email=raw_email,
+        raw_email=resolved_raw_email or "",
         mail_from=mail_from,
         rcpt_to=rcpt_to or [],
         ip=ip,

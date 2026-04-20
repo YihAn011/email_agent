@@ -134,6 +134,14 @@ def summarize_invoked_tools(messages: list[BaseMessage], start_idx: int) -> str:
     return ", ".join(parts)
 
 
+def invoked_tool_names(messages: list[BaseMessage], start_idx: int) -> set[str]:
+    return {
+        message.name
+        for message in messages[start_idx:]
+        if isinstance(message, ToolMessage) and message.name
+    }
+
+
 def extract_final_output(result: dict[str, Any]) -> str:
     messages = result.get("messages", [])
     for message in reversed(messages):
@@ -147,6 +155,147 @@ def latest_ai_message(messages: list[BaseMessage]) -> str:
         if isinstance(message, AIMessage):
             return render_content(message.content)
     return "No AI response was produced."
+
+
+def latest_ai_has_tool_calls(messages: list[BaseMessage]) -> bool:
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            return bool(getattr(message, "tool_calls", None))
+    return False
+
+
+def needs_email_verdict_workflow(prompt: str) -> bool:
+    lowered = prompt.lower()
+    verdict_terms = (
+        "required workflow",
+        "raw rfc822 email",
+        "raw email headers",
+        "analyze this email",
+        "check this email",
+        "html email",
+        "email template",
+        "phishing",
+        "spam",
+        "verdict",
+        "referenced email",
+        "<html",
+        "<table",
+        "unsubscribe",
+        "tracking pixel",
+        "coupon",
+        "offer",
+        "分析邮件",
+        "检查邮件",
+        "钓鱼",
+        "垃圾邮件",
+    )
+    return any(term in lowered for term in verdict_terms)
+
+
+def needs_empty_response_recovery(
+    messages: list[BaseMessage],
+    start_idx: int,
+    prompt: str,
+) -> bool:
+    if not needs_email_verdict_workflow(prompt):
+        return False
+    if latest_ai_message(messages).strip():
+        return False
+    if latest_ai_has_tool_calls(messages):
+        return False
+    tools = invoked_tool_names(messages, start_idx)
+    if "rspamd_scan_email" in tools or "email_header_auth_check" in tools or "scan_recent_imap_emails" in tools:
+        return False
+    return "list_error_patterns" in tools
+
+
+def needs_missing_tool_recovery(
+    messages: list[BaseMessage],
+    start_idx: int,
+    prompt: str,
+) -> bool:
+    if not needs_email_verdict_workflow(prompt):
+        return False
+    tools = invoked_tool_names(messages, start_idx)
+    security_tools = {
+        "list_error_patterns",
+        "rspamd_scan_email",
+        "email_header_auth_check",
+        "url_reputation_check",
+        "urgency_check",
+        "error_pattern_memory_check",
+        "scan_recent_imap_emails",
+    }
+    if tools & security_tools:
+        return False
+    body = latest_ai_message(messages).strip()
+    if not body:
+        return False
+    return not body.lower().startswith("email:")
+
+
+def build_missing_tool_recovery_prompt() -> str:
+    return (
+        "The previous response summarized the email content instead of performing an email security verdict. "
+        "Redo the same user request now as an email security check. First call `list_error_patterns`, then use "
+        "`rspamd_scan_email` for the raw email or HTML email content, plus `url_reputation_check` and "
+        "`urgency_check` when possible. Use `email_header_auth_check` only if full raw headers are available as a string. "
+        "Before the final answer, call `error_pattern_memory_check`. Do not summarize the HTML template structure. Give only the short template: "
+        "Email, Type, Verdict, Evidence. The Verdict must be exactly one of Normal, Spam, Phishing."
+    )
+
+
+def build_empty_response_recovery_prompt() -> str:
+    return (
+        "The previous assistant turn ended with empty content after only the preliminary memory tool. "
+        "Continue the same user request now. Complete the mandatory email verdict workflow: run the "
+        "normal security tool that fits the provided evidence, such as `rspamd_scan_email` for raw "
+        "email content or `email_header_auth_check` for headers, then call "
+        "`error_pattern_memory_check`, then give a concise final verdict. If a tool is unavailable, "
+        "say so and still provide a plain-language assessment from the visible email content."
+    )
+
+
+def needs_broader_email_checks(
+    messages: list[BaseMessage],
+    start_idx: int,
+    prompt: str,
+) -> bool:
+    if not needs_email_verdict_workflow(prompt):
+        return False
+    lowered = prompt.lower()
+    if "raw rfc822 email" not in lowered and "referenced email" not in lowered:
+        return False
+    tools = invoked_tool_names(messages, start_idx)
+    if "rspamd_scan_email" not in tools:
+        return False
+    expected = {
+        "url_reputation_check",
+        "urgency_check",
+        "error_pattern_memory_check",
+    }
+    return bool(expected - tools)
+
+
+def build_broader_email_checks_prompt(messages: list[BaseMessage], start_idx: int) -> str:
+    tools = invoked_tool_names(messages, start_idx)
+    missing = [
+        name
+        for name in (
+            "url_reputation_check",
+            "urgency_check",
+            "error_pattern_memory_check",
+        )
+        if name not in tools
+    ]
+    return (
+        "Continue the same email analysis before giving the final verdict. "
+        f"The current tool evidence is incomplete; run these missing checks if possible: {', '.join(missing)}. "
+        "Do not classify the email as Spam or Phishing from Rspamd score alone. "
+        "Use URL/content risk, urgency/social-pressure signals, and error-pattern memory as corroborating evidence; include header authentication only if it already ran cleanly. "
+        "Then answer briefly with the exact template: Email, Type, Verdict, Evidence. "
+        "The Verdict must be exactly one of Normal, Spam, Phishing."
+    )
 
 
 def is_quota_error(exc: Exception) -> bool:
@@ -339,8 +488,48 @@ class _BaseRuntime:
         matches = self.router.route(prompt, limit=limit)
         names: list[str] = []
         lowered = prompt.lower()
-        if any(token in lowered for token in ("email", "mailbox", "headers", "phishing", "spam", "verdict")):
-            names.extend(["list_error_patterns", "error_pattern_memory_check"])
+        raw_email_request = any(
+            token in lowered
+            for token in (
+                "raw rfc822",
+                "begin raw rfc822",
+                "referenced email",
+                "<html",
+                "<table",
+                "unsubscribe",
+                "coupon",
+                "offer",
+            )
+        )
+        if raw_email_request:
+            names.extend(
+                [
+                    "list_error_patterns",
+                    "rspamd_scan_email",
+                    "url_reputation_check",
+                    "urgency_check",
+                    "error_pattern_memory_check",
+                ]
+            )
+        if any(
+            token in lowered
+            for token in (
+                "email",
+                "mailbox",
+                "headers",
+                "phishing",
+                "spam",
+                "verdict",
+                "<html",
+                "<table",
+                "unsubscribe",
+                "coupon",
+                "offer",
+            )
+        ):
+            for name in ("list_error_patterns", "error_pattern_memory_check"):
+                if name not in names:
+                    names.append(name)
         for item in matches:
             if item.name not in names:
                 names.append(item.name)
@@ -399,6 +588,45 @@ class EmailAgentRuntime(_BaseRuntime):
                             for line in describe_progress_message(message):
                                 progress_callback(line)
                         emitted_count = len(latest_messages)
+            if needs_missing_tool_recovery(latest_messages, start_idx, content):
+                recovery_message = HumanMessage(content=build_missing_tool_recovery_prompt())
+                latest_messages = [*latest_messages, recovery_message]
+                if progress_callback:
+                    progress_callback("Running email security tools")
+                async for state in self.agent.astream({"messages": latest_messages}, stream_mode="values"):
+                    if isinstance(state, dict) and isinstance(state.get("messages"), list):
+                        latest_messages = state["messages"]
+                        if progress_callback and len(latest_messages) > emitted_count:
+                            for message in latest_messages[emitted_count:]:
+                                for line in describe_progress_message(message):
+                                    progress_callback(line)
+                            emitted_count = len(latest_messages)
+            if needs_empty_response_recovery(latest_messages, start_idx, content):
+                recovery_message = HumanMessage(content=build_empty_response_recovery_prompt())
+                latest_messages = [*latest_messages, recovery_message]
+                if progress_callback:
+                    progress_callback("Continuing incomplete email analysis")
+                async for state in self.agent.astream({"messages": latest_messages}, stream_mode="values"):
+                    if isinstance(state, dict) and isinstance(state.get("messages"), list):
+                        latest_messages = state["messages"]
+                        if progress_callback and len(latest_messages) > emitted_count:
+                            for message in latest_messages[emitted_count:]:
+                                for line in describe_progress_message(message):
+                                    progress_callback(line)
+                            emitted_count = len(latest_messages)
+            if needs_broader_email_checks(latest_messages, start_idx, content):
+                recovery_message = HumanMessage(content=build_broader_email_checks_prompt(latest_messages, start_idx))
+                latest_messages = [*latest_messages, recovery_message]
+                if progress_callback:
+                    progress_callback("Running additional safety checks")
+                async for state in self.agent.astream({"messages": latest_messages}, stream_mode="values"):
+                    if isinstance(state, dict) and isinstance(state.get("messages"), list):
+                        latest_messages = state["messages"]
+                        if progress_callback and len(latest_messages) > emitted_count:
+                            for message in latest_messages[emitted_count:]:
+                                for line in describe_progress_message(message):
+                                    progress_callback(line)
+                            emitted_count = len(latest_messages)
         except Exception:
             self.history = latest_messages
             raise
