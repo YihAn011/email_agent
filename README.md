@@ -48,11 +48,30 @@ cd ~/Desktop/email_agent
 python chatbot.py
 ```
 
+Start the Ubuntu desktop pet UI:
+
+```bash
+cd ~/Desktop/email_agent
+source .venv/bin/activate
+pip install -r requirements.txt
+python desktop_pet.py
+```
+
+If Qt fails with an `xcb` platform plugin error on Ubuntu, install the missing
+system dependency and run it again:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libxcb-cursor0
+```
+
 Override the provider or model at runtime if needed:
 
 ```bash
 python chatbot.py --provider gemini --model gemini-2.5-flash
 python chatbot.py --provider ollama --model qwen3:latest
+python desktop_pet.py --provider gemini --model gemini-2.5-flash
+python desktop_pet.py --provider ollama --model qwen3:latest
 python examples/run_langgraph_gemini_agent.py --provider gemini --model gemini-2.5-flash
 python examples/run_langgraph_gemini_agent.py --provider ollama --model qwen3:latest
 ```
@@ -72,37 +91,39 @@ Skills:
 
 - `skills/rspamd/skill.py`
 - `skills/header_auth/skill.py`
-- `skills/imap_monitor/skill.py`
+# Email Agent — Quick Start
 
-MCP tools:
+Minimal steps to run the desktop pet UI or the full local stack.
 
-- `rspamd_scan_email`
-- `email_header_auth_check`
-- `bind_imap_mailbox`
-- `setup_imap_monitor`
-- `start_imap_monitor`
-- `stop_imap_monitor`
-- `imap_monitor_status`
-- `poll_imap_mailboxes_once`
-- `list_recent_email_results`
-- `scan_recent_imap_emails`
+Prerequisites
+- Python 3
+- (Optional) `redis-server` and `rspamd` for full features, or use the mock server.
 
-## 4. Architecture Layer
-
-The project now includes an explicit harness layer inspired by Claude Code-style architecture separation:
-
-- `harness/capability_registry.py`
-- `harness/request_router.py`
-- `harness/system_manifest.py`
-- `harness/query_engine.py`
-- `harness/audit.py`
-- `harness/runtime.py`
-
-Useful inspection commands:
-
+Initial setup (once):
 ```bash
-python -m harness.main summary
-python -m harness.main manifest
-python -m harness.main audit
-python -m harness.main route "check my latest 5 emails"
+cd ~/Desktop/email_agent
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # edit .env with your keys and models
 ```
+
+Run options
+- Run UI only (uses `.env` or flags):
+```bash
+python desktop_pet.py [--provider gemini|ollama] [--model MODEL]
+```
+- Start full local stack (starts/ensures redis, rspamd, optional Ollama or mock, then runs pet):
+```bash
+./scripts/start_full_stack.sh [--provider ollama --model qwen3:latest]
+USE_MOCK_RSPAMD=1 ./scripts/start_full_stack.sh
+```
+
+Notes
+- Set environment defaults in `.env`: `LLM_PROVIDER`, `GEMINI_MODEL`, `OLLAMA_MODEL`, `RSPAMD_BASE_URL`.
+- Ubuntu Qt `xcb` plugin error: `sudo apt-get install -y libxcb-cursor0`.
+- `start_full_stack.sh` will export `EMAIL_AGENT_STACK_CHILD_PIDS` so `desktop_pet.py` can shut down spawned services.
+
+Commands reference
+- Launch UI: `python desktop_pet.py`
+- Launch full stack + UI: `./scripts/start_full_stack.sh`
