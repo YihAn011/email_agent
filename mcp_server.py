@@ -10,6 +10,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from skills.header_auth.schemas import EmailHeaderAuthCheckInput
 from skills.header_auth.skill import EmailHeaderAuthCheckSkill
+from skills.content_model.schemas import ContentModelCheckInput
+from skills.content_model.skill import ContentModelCheckSkill
 from skills.error_patterns.schemas import ErrorPatternMemoryCheckInput, ListErrorPatternsInput
 from skills.error_patterns.skill import ErrorPatternMemoryCheckSkill, ListErrorPatternsSkill
 from skills.imap_monitor.schemas import (
@@ -37,6 +39,8 @@ from skills.rspamd.schemas import RspamdScanEmailInput
 from skills.rspamd.skill import RspamdScanEmailSkill
 from skills.scam_indicators.schemas import ScamIndicatorCheckInput
 from skills.scam_indicators.skill import ScamIndicatorCheckSkill
+from skills.spam_campaign.schemas import SpamCampaignCheckInput
+from skills.spam_campaign.skill import SpamCampaignCheckSkill
 from skills.urgency.schemas import UrgencyCheckInput
 from skills.urgency.skill import UrgencyCheckSkill
 from skills.url_reputation.schemas import UrlReputationInput
@@ -90,9 +94,12 @@ mcp = FastMCP(
         "Use rspamd_scan_email to scan RFC822 raw emails with rspamd, and "
         "email_header_auth_check to quickly triage header authentication signals. "
         "Use urgency_check to score the urgency/pressure level of an email using a trained classifier. "
+        "Use content_model_check to score the textual body, subject, and sender fields using a calibrated low-false-positive classifier. "
         "Use url_reputation_check to score URL/content phishing risk using a trained GradientBoosting model. "
         "Use scam_indicator_check to detect obvious scam indicators like gift-card or crypto payment demands, "
         "extortion threats, lookalike domains, and suspicious reply-to addresses. "
+        "Use spam_campaign_check to detect high-precision spam campaign patterns such as stock pump, pharmacy, "
+        "replica-watch, pirated software, and payment-mule job spam. "
         "Use error_pattern_memory_check to consult known dataset-derived misclassification patterns before finalizing a verdict, "
         "and list_error_patterns to inspect those stored patterns. "
         "Use list_bound_imap_mailboxes to discover already saved mailbox bindings before asking the user "
@@ -164,6 +171,31 @@ def email_header_auth_check(
     skill = EmailHeaderAuthCheckSkill()
     result = skill.run(payload)
     return result.model_dump()
+
+
+@mcp.tool(
+    name="content_model_check",
+    description=(
+        "Score the subject, sender, and body text of an email using a calibrated text classifier tuned "
+        "for low false-positive spam/phishing detection."
+    ),
+)
+def content_model_check(
+    email_text: str,
+    subject: str = "",
+    from_address: str = "",
+    sender_domain: str = "",
+    content_types: str = "",
+) -> dict[str, Any]:
+    payload = ContentModelCheckInput(
+        email_text=email_text,
+        subject=subject,
+        from_address=from_address,
+        sender_domain=sender_domain,
+        content_types=content_types,
+    )
+    skill = ContentModelCheckSkill()
+    return skill.run(payload).model_dump()
 
 
 @mcp.tool(
@@ -422,6 +454,30 @@ def scam_indicator_check(
         from_address=from_address,
     )
     skill = ScamIndicatorCheckSkill()
+    return skill.run(payload).model_dump()
+
+
+@mcp.tool(
+    name="spam_campaign_check",
+    description=(
+        "Detect high-precision spam campaign patterns such as stock pump messages, pharmacy spam, "
+        "replica-watch campaigns, pirated software spam, payment-mule job spam, and known spam campaign markers. "
+        "Use this after rspamd_score is already suspicious (>7) to improve spam recall without broadly lowering thresholds."
+    ),
+)
+def spam_campaign_check(
+    raw_email: str = "",
+    email_text: str = "",
+    subject: str = "",
+    from_address: str = "",
+) -> dict[str, Any]:
+    payload = SpamCampaignCheckInput(
+        raw_email=raw_email,
+        email_text=email_text,
+        subject=subject,
+        from_address=from_address,
+    )
+    skill = SpamCampaignCheckSkill()
     return skill.run(payload).model_dump()
 
 

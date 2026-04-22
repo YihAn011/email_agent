@@ -15,9 +15,18 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from skills.header_auth.schemas import EmailHeaderAuthCheckInput
 from skills.header_auth.skill import EmailHeaderAuthCheckSkill
-from skills.imap_monitor.skill import _compose_final_verdict
+from skills.imap_monitor.skill import (
+    _apply_error_pattern_guidance,
+    _apply_memory_guidance,
+    _compose_final_verdict,
+    _load_error_pattern_context,
+)
 from skills.rspamd.schemas import RspamdScanEmailInput
 from skills.rspamd.skill import RspamdScanEmailSkill
+from skills.scam_indicators.schemas import ScamIndicatorCheckInput
+from skills.scam_indicators.skill import ScamIndicatorCheckSkill
+from skills.spam_campaign.schemas import SpamCampaignCheckInput
+from skills.spam_campaign.skill import SpamCampaignCheckSkill
 from skills.urgency.schemas import UrgencyCheckInput
 from skills.urgency.skill import UrgencyCheckSkill
 from skills.url_reputation.schemas import UrlReputationInput
@@ -51,6 +60,8 @@ def evaluate_row(
     header_skill: EmailHeaderAuthCheckSkill,
     urgency_skill: UrgencyCheckSkill,
     url_skill: UrlReputationSkill,
+    scam_skill: ScamIndicatorCheckSkill,
+    spam_skill: SpamCampaignCheckSkill,
 ) -> dict[str, object]:
     raw_email = build_raw_email(row)
     rspamd_result = rspamd_skill.run(
@@ -76,8 +87,49 @@ def evaluate_row(
             has_attachments=int(float(row.get("has_attachments", 0) or 0)),
         )
     )
+    scam_result = scam_skill.run(
+        ScamIndicatorCheckInput(
+            raw_email=raw_email,
+            subject=row.get("subject", ""),
+            from_address=row.get("sender", ""),
+        )
+    )
+    spam_result = spam_skill.run(
+        SpamCampaignCheckInput(
+            raw_email=raw_email,
+            email_text=row.get("email_text", ""),
+            subject=row.get("subject", ""),
+            from_address=row.get("sender", ""),
+        )
+    )
 
-    predicted_verdict, summary = _compose_final_verdict(rspamd_result, header_result)
+    predicted_verdict, summary = _compose_final_verdict(
+        rspamd_result,
+        header_result,
+        urgency_result,
+        url_result,
+        scam_result,
+        spam_result,
+        subject=row.get("subject", ""),
+        from_address=row.get("sender", ""),
+    )
+    _, summary = _load_error_pattern_context(summary)
+    predicted_verdict, _, _, summary = _apply_error_pattern_guidance(
+        subject=row.get("subject", ""),
+        from_address=row.get("sender", ""),
+        current_verdict=predicted_verdict,
+        rspamd_risk_level=rspamd_result.data.risk_level if rspamd_result.ok and rspamd_result.data else None,
+        header_risk_level=header_result.data.risk_level if header_result.ok and header_result.data else None,
+        urgency_label=urgency_result.data.urgency_label if urgency_result.ok and urgency_result.data else None,
+        url_risk_level=url_result.data.risk_level if url_result.ok and url_result.data else None,
+        summary=summary,
+    )
+    predicted_verdict, _, _, summary = _apply_memory_guidance(
+        subject=row.get("subject", ""),
+        from_address=row.get("sender", ""),
+        current_verdict=predicted_verdict,
+        summary=summary,
+    )
     predicted_binary = 0 if predicted_verdict == "benign" else 1
     actual_binary = int(row["binary_label"])
 
@@ -111,6 +163,12 @@ def evaluate_row(
         "url_ok": url_result.ok,
         "url_risk_level": url_result.data.risk_level if url_result.ok and url_result.data else None,
         "url_score": url_result.data.phishing_score if url_result.ok and url_result.data else None,
+        "scam_ok": scam_result.ok,
+        "scam_risk_level": scam_result.data.risk_level if scam_result.ok and scam_result.data else None,
+        "scam_matched": scam_result.data.matched if scam_result.ok and scam_result.data else None,
+        "spam_ok": spam_result.ok,
+        "spam_risk_level": spam_result.data.risk_level if spam_result.ok and spam_result.data else None,
+        "spam_matched": spam_result.data.matched if spam_result.ok and spam_result.data else None,
         "summary": summary,
     }
 
@@ -148,6 +206,8 @@ def main() -> None:
     header_skill = EmailHeaderAuthCheckSkill()
     urgency_skill = UrgencyCheckSkill()
     url_skill = UrlReputationSkill()
+    scam_skill = ScamIndicatorCheckSkill()
+    spam_skill = SpamCampaignCheckSkill()
 
     processed = 0
     with input_path.open(newline="", encoding="utf-8", errors="ignore") as handle, output_path.open(
@@ -165,6 +225,8 @@ def main() -> None:
                 header_skill=header_skill,
                 urgency_skill=urgency_skill,
                 url_skill=url_skill,
+                scam_skill=scam_skill,
+                spam_skill=spam_skill,
             )
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
             out.flush()

@@ -46,18 +46,49 @@ def infer_risk_level(score: float, required_score: float | None, categories: Lis
     return "low"
 
 
-def recommend_next_skills(categories: List[str], score: float) -> List[str]:
+def _score_band(score: float, action: str | None) -> str:
+    action_lc = (action or "").lower()
+    if score >= 12 or action_lc in {"soft reject", "reject"}:
+        return "high"
+    if score >= 7 or action_lc in {"add header", "rewrite subject"}:
+        return "elevated"
+    if score >= 4:
+        return "gray"
+    return "low"
+
+
+def recommend_next_skills(categories: List[str], score: float, action: str | None = None) -> List[str]:
     recommendations: List[str] = []
     category_set = set(categories)
+    band = _score_band(score, action)
+    has_phish_signal = bool(category_set & {"phishing", "spoofing", "suspicious_links"})
+    has_spam_signal = bool(category_set & {"spam", "reputation_issue"})
+    has_auth_signal = "authentication_issue" in category_set
 
-    if "phishing" in category_set or "suspicious_links" in category_set:
+    if has_phish_signal:
         recommendations.append("url_reputation_check")
-    if "authentication_issue" in category_set:
         recommendations.append("email_header_auth_check")
-    if "attachment_risk" in category_set:
-        recommendations.append("attachment_analyzer")
-    if score >= 4 or "phishing" in category_set:
-        recommendations.append("llm_phishing_reasoner")
+        recommendations.append("scam_indicator_check")
+        if band in {"gray", "elevated", "high"}:
+            recommendations.append("urgency_check")
+
+    if has_spam_signal:
+        recommendations.append("spam_campaign_check")
+        if "suspicious_links" in category_set or band in {"elevated", "high"}:
+            recommendations.append("url_reputation_check")
+
+    if has_auth_signal:
+        recommendations.append("email_header_auth_check")
+        if band in {"elevated", "high"}:
+            recommendations.append("scam_indicator_check")
+
+    if "attachment_risk" in category_set and "url_reputation_check" not in recommendations:
+        recommendations.append("url_reputation_check")
+
+    if band in {"elevated", "high"}:
+        recommendations.append("list_error_patterns")
+    if band == "high" or (band == "elevated" and has_phish_signal):
+        recommendations.append("error_pattern_memory_check")
 
     seen = set()
     deduped: List[str] = []
@@ -116,7 +147,7 @@ def normalize_rspamd_result(raw_result: Dict[str, Any], include_raw_result: bool
     symbols = extract_symbols(raw_result)
     categories = sorted({sym.category for sym in symbols if sym.category})
     risk_level = infer_risk_level(score, required_score, categories)
-    next_skills = recommend_next_skills(categories, score)
+    next_skills = recommend_next_skills(categories, score, action)
     summary = summarize(action, score, categories, len(symbols))
 
     return RspamdNormalizedResult(

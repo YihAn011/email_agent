@@ -97,9 +97,12 @@ def _email_from_prompt(messages: list[BaseMessage], start_idx: int) -> str:
 
 def _required_decision_label(
     rspamd_data: dict[str, Any],
+    content_data: dict[str, Any] | None = None,
     header_data: dict[str, Any] | None = None,
     url_data: dict[str, Any] | None = None,
     urgency_data: dict[str, Any] | None = None,
+    scam_data: dict[str, Any] | None = None,
+    spam_data: dict[str, Any] | None = None,
     subject: str = "",
     from_address: str = "",
 ) -> str:
@@ -110,17 +113,43 @@ def _required_decision_label(
         if isinstance(item, dict)
     }
     risk = str(rspamd_data.get("risk_level") or "").lower()
+    content_risk = str((content_data or {}).get("risk_level") or "").lower()
+    content_score = float((content_data or {}).get("malicious_score") or 0.0)
+    content_malicious = bool((content_data or {}).get("is_malicious"))
     header_risk = str((header_data or {}).get("risk_level") or "").lower()
     action = str(rspamd_data.get("action") or "").lower()
+    score = float(rspamd_data.get("score") or 0.0)
     url_risk = str((url_data or {}).get("risk_level") or "").lower()
     url_suspicious = bool((url_data or {}).get("is_suspicious"))
     urgency_risk = str((urgency_data or {}).get("risk_contribution") or "").lower()
     urgent = bool((urgency_data or {}).get("is_urgent"))
+    scam_matched = bool((scam_data or {}).get("matched"))
+    scam_risk = str((scam_data or {}).get("risk_level") or "").lower()
+    spam_matched = bool((spam_data or {}).get("matched"))
+    spam_risk = str((spam_data or {}).get("risk_level") or "").lower()
     email_type = _classify_email_type(subject, from_address)
     sender_text = f"{subject} {from_address}".lower()
     branded_marketing = (
         email_type == "Promotional / advertising email"
         and any(token in sender_text for token in ("subway", "subs.subway.com", "news@subs.subway.com"))
+    )
+    account_or_security_context = any(
+        token in sender_text
+        for token in (
+            "account",
+            "verify",
+            "verification",
+            "password",
+            "login",
+            "sign-in",
+            "security",
+            "mailbox",
+            "help desk",
+            "bank",
+            "statement",
+            "invoice",
+            "payment",
+        )
     )
     header_format_noise = bool(
         symbols
@@ -140,22 +169,73 @@ def _required_decision_label(
         and urgency_risk in {"", "low", "unknown"}
         and not urgent
         and header_risk in {"", "low", "unknown", "n/a"}
+        and not scam_matched
+        and not spam_matched
+    )
+    has_phish_signal = bool({"phishing", "spoofing", "suspicious_links"} & categories)
+    has_spam_signal = bool("spam" in categories or any("bayes" in item for item in symbols) or "reputation_issue" in categories)
+    high_rspamd = score >= 12 or action in {"soft reject", "reject"}
+    elevated_rspamd = score >= 7 or action in {"add header", "rewrite subject", "soft reject", "reject"}
+    content_high = content_score >= 0.85
+    content_elevated = content_malicious or content_risk in {"medium", "high"}
+    phish_corroboration = sum(
+        1
+        for condition in (
+            header_risk in {"medium", "high"},
+            url_risk in {"medium", "high"} or url_suspicious,
+            scam_matched,
+            urgency_risk in {"medium", "high"} or urgent,
+            has_phish_signal,
+        )
+        if condition
     )
 
-    if url_risk == "high" or (url_suspicious and urgency_risk in {"medium", "high"}):
+    if header_risk == "high" and (url_suspicious or scam_matched):
         return "Phishing"
-    if {"phishing", "spoofing", "suspicious_links"} & categories and url_risk in {"medium", "high"}:
+    if content_high and account_or_security_context and phish_corroboration >= 1:
         return "Phishing"
-    if header_risk == "high" and url_suspicious:
+    if content_elevated and account_or_security_context and phish_corroboration >= 2:
         return "Phishing"
+    if has_phish_signal and (url_risk in {"medium", "high"} or scam_matched):
+        return "Phishing"
+    if url_risk == "high" and (has_phish_signal or scam_matched or header_risk in {"medium", "high"}):
+        return "Phishing"
+    if account_or_security_context and sum(
+        1
+        for condition in (
+            header_risk in {"medium", "high"},
+            url_risk in {"medium", "high"} or url_suspicious,
+            scam_matched,
+            urgency_risk in {"medium", "high"} or urgent,
+            elevated_rspamd,
+        )
+        if condition
+    ) >= 2:
+        return "Phishing"
+    if content_data is not None and not content_malicious and not spam_matched:
+        return "Normal"
 
     if branded_marketing and corroborating_checks_low:
         return "Normal"
     if action == "reject" and header_format_noise and corroborating_checks_low:
         return "Normal"
-    if "spam" in categories or any("bayes" in item for item in symbols) or action == "reject":
+    if content_high and not account_or_security_context:
         return "Spam"
-    if risk == "high" and (urgent or url_risk == "medium"):
+    if content_elevated and (has_spam_signal or spam_matched or spam_risk in {"medium", "high"}):
+        return "Spam"
+    if spam_matched and (
+        has_spam_signal
+        or spam_risk == "high"
+        or (url_risk in {"medium", "high"} and header_risk not in {"medium", "high"})
+    ):
+        return "Spam"
+    if has_spam_signal and not has_phish_signal:
+        return "Spam"
+    if high_rspamd and not has_phish_signal and header_risk not in {"medium", "high"}:
+        return "Spam"
+    if risk == "high" and (urgent or url_risk == "medium") and not account_or_security_context:
+        return "Spam"
+    if content_malicious and not account_or_security_context and corroborating_checks_low:
         return "Spam"
     return "Normal"
 
@@ -383,9 +463,12 @@ def _render_recent_scan(messages: list[BaseMessage], start_idx: int) -> str | No
 
 def _render_single_email_analysis(messages: list[BaseMessage], start_idx: int) -> str | None:
     rspamd_payload = _last_tool_payload(messages[start_idx:], "rspamd_scan_email")
+    content_payload = _last_tool_payload(messages[start_idx:], "content_model_check")
     header_payload = _last_tool_payload(messages[start_idx:], "email_header_auth_check")
     url_payload = _last_tool_payload(messages[start_idx:], "url_reputation_check")
     urgency_payload = _last_tool_payload(messages[start_idx:], "urgency_check")
+    scam_payload = _last_tool_payload(messages[start_idx:], "scam_indicator_check")
+    spam_payload = _last_tool_payload(messages[start_idx:], "spam_campaign_check")
     if not rspamd_payload or rspamd_payload.get("ok") is False:
         return None
 
@@ -394,6 +477,7 @@ def _render_single_email_analysis(messages: list[BaseMessage], start_idx: int) -
         return None
 
     header_data = header_payload.get("data") if isinstance(header_payload, dict) else None
+    content_data = content_payload.get("data") if isinstance(content_payload, dict) else None
     url_data = url_payload.get("data") if isinstance(url_payload, dict) else None
     urgency_data = urgency_payload.get("data") if isinstance(urgency_payload, dict) else None
     categories = rspamd_data.get("categories") or []
@@ -409,9 +493,12 @@ def _render_single_email_analysis(messages: list[BaseMessage], start_idx: int) -
     from_address = _email_from_prompt(messages, start_idx)
     decision = _required_decision_label(
         rspamd_data,
+        content_data if isinstance(content_data, dict) else None,
         header_data if isinstance(header_data, dict) else None,
         url_data if isinstance(url_data, dict) else None,
         urgency_data if isinstance(urgency_data, dict) else None,
+        scam_payload.get("data") if isinstance(scam_payload, dict) else None,
+        spam_payload.get("data") if isinstance(spam_payload, dict) else None,
         subject,
         from_address,
     )
@@ -426,6 +513,12 @@ def _render_single_email_analysis(messages: list[BaseMessage], start_idx: int) -
     ]
     if isinstance(header_data, dict):
         lines.append(f"- The sender and authentication headers looked {header_risk} risk.")
+    if isinstance(content_data, dict):
+        lines.append(
+            "- The calibrated content classifier scored the message at "
+            + f"{content_data.get('malicious_score', 'unknown')} "
+            + f"with {content_data.get('risk_level', 'unknown')} risk."
+        )
     if isinstance(url_data, dict):
         lines.append(
             "- The links and URL patterns looked "

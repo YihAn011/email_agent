@@ -55,9 +55,15 @@ def build_system_prompt(persona: str) -> str:
         "",
         "Decision workflow for any email verdict:",
         "- For raw email content, start with `rspamd_scan_email`.",
-        "- If the Rspamd score is 7 or lower and there is no clear need for extra checks, you may finalize from the Rspamd result alone.",
-        "- If the Rspamd score is greater than 7, treat the email as suspicious and use additional relevant MCP tools such as `scam_indicator_check`, `url_reputation_check`, `urgency_check`, `email_header_auth_check`, `list_error_patterns`, or `error_pattern_memory_check` before finalizing.",
-        "- If the Rspamd score is greater than 10, treat the email as highly suspicious. The extra tools are mainly there to prevent false positives, not to erase strong scam evidence. Do not downgrade to Normal unless the additional checks give a clear benign explanation, such as trusted sender authentication, safe links, low-pressure wording, and a known false-positive pattern.",
+        "- Treat Rspamd as the primary router, not the final judge.",
+        "- When the email is mostly plain body text, or when headers are synthetic/incomplete, use `content_model_check` early because it is calibrated for low-FPR text classification.",
+        "- If the Rspamd score is below 4 and it only shows weak formatting/authentication noise, you may finalize from Rspamd alone.",
+        "- If the Rspamd score is 4 to under 7, use categories and symbols to choose targeted checks: authentication issues -> `email_header_auth_check`; suspicious links/phishing/spoofing -> `url_reputation_check` and `scam_indicator_check`; spam/reputation/BAYES signals -> `spam_campaign_check`.",
+        "- If the Rspamd score is 7 to under 12, treat the email as suspicious and usually run `email_header_auth_check` plus one category-matching skill before finalizing.",
+        "- If the Rspamd score is 12 or higher, or its action is `soft reject` or `reject`, run corroborating checks to separate Spam from Phishing. Do not downgrade to Normal unless the added checks give a clear benign explanation.",
+        "- For low-FPR binary screening, let `content_model_check` decide whether the message is malicious first; then use Rspamd, header, URL, scam, and campaign checks mainly to split Spam vs Phishing and to explain the verdict.",
+        "- Use `urgency_check` only as supporting evidence for account-security, phishing, or suspicious-link cases. Do not treat urgency alone as enough to call an email Spam or Phishing.",
+        "- Use `list_error_patterns` and `error_pattern_memory_check` only after you already have provisional evidence from Rspamd and the relevant content/header tools.",
         "- If raw RFC822 content is delimited by BEGIN RAW RFC822 / END RAW RFC822, call `rspamd_scan_email` with a `raw_email` string containing that complete block content exactly, not a summary, JSON object, body-only text, or extracted fields. Use `email_text` only for `url_reputation_check` and `urgency_check`.",
         "- Do not classify an email as Phishing from Rspamd score alone. For phishing verdicts, prefer corroborating URL/content, urgency/social-pressure, header-auth, or remembered-pattern evidence when available.",
         "- If the user provides HTML email content or an email template and asks to check/analyze the email, do not summarize the HTML structure. Treat it as email content, run the email security tools, and return the verdict template.",
@@ -98,8 +104,7 @@ def build_analysis_prompt(
     sections = [question.strip()]
     if raw_email:
         sections.append(
-            "Workflow: call `rspamd_scan_email` first. If its score is greater than 7, "
-            "choose any additional relevant MCP tools before the final verdict."
+            "Workflow: call `rspamd_scan_email` first, then let its score, action, categories, and symbols decide which additional MCP tools are actually relevant before the final verdict."
         )
         sections.append("Use the available MCP tools to analyze the following raw RFC822 email:")
         sections.append(raw_email)
@@ -119,8 +124,7 @@ def build_single_turn_prompt(
 ) -> str:
     sections = [question.strip()]
     sections.append(
-        "Workflow: call `rspamd_scan_email` first for raw email. If its score is greater than 7, "
-        "choose any additional relevant MCP tools before the final verdict."
+        "Workflow: call `rspamd_scan_email` first for raw email. Then use its score, action, categories, and symbols to choose only the relevant follow-up MCP tools before the final verdict."
     )
     if raw_email:
         sections.append("Use the available MCP tools to analyze the following raw RFC822 email:")

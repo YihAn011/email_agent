@@ -14,6 +14,40 @@
       console.log(EVENT_PREFIX + JSON.stringify(payload));
     }
 
+    function formatError(error) {
+      if (!error) {
+        return "Unknown Puter error.";
+      }
+      if (typeof error === "string") {
+        return error;
+      }
+      const message = error.message || error.error || error.code || error.statusText || "";
+      const details = {};
+      for (const key of Object.keys(error)) {
+        const value = error[key];
+        if (typeof value === "function") {
+          continue;
+        }
+        details[key] = value;
+      }
+      let detailText = "";
+      try {
+        detailText = JSON.stringify(details);
+      } catch (_jsonError) {
+        detailText = "";
+      }
+      if (message && detailText && detailText !== "{}") {
+        return `${message} ${detailText}`;
+      }
+      if (message) {
+        return String(message);
+      }
+      if (detailText && detailText !== "{}") {
+        return detailText;
+      }
+      return String(error);
+    }
+
     async function waitForPuter() {
       const startedAt = Date.now();
       while (Date.now() - startedAt < 15000) {
@@ -129,7 +163,7 @@
         emitEvent({
           type: "error",
           request_id: payload.request_id,
-          message: error && error.message ? error.message : String(error),
+          message: formatError(error),
         });
       }
     };

@@ -48,7 +48,7 @@ class ScamIndicatorCheckSkill(BaseSkill[ScamIndicatorCheckInput, ScamIndicatorCh
                     reason="PayPal branding is used from a non-PayPal sender domain.",
                 )
 
-            if any(token in text for token in ("paypai", "paypaı", "paypa1", "payi", "paypal-login")):
+            if any(token in text for token in ("paypai", "paypaı", "paypa1", "paypal-login")):
                 _add(
                     reasons=reasons,
                     indicators=indicators,
@@ -136,6 +136,68 @@ class ScamIndicatorCheckSkill(BaseSkill[ScamIndicatorCheckInput, ScamIndicatorCh
                     indicators=indicators,
                     indicator="classic_scam_wording",
                     reason="The wording contains classic scam markers and obvious impersonation cues.",
+                )
+
+            account_terms = sum(
+                1
+                for token in (
+                    "mailbox",
+                    "account",
+                    "verification",
+                    "verify",
+                    "password",
+                    "help desk",
+                    "suspension",
+                    "suspended",
+                    "security alert",
+                    "unusual activity",
+                    "statement",
+                    "receipt",
+                )
+                if token in text
+            )
+            action_terms = sum(
+                1
+                for token in (
+                    "click",
+                    "login",
+                    "sign in",
+                    "confirm",
+                    "update",
+                    "validate",
+                    "webmail",
+                    "office365",
+                    "outlook",
+                    "authorize",
+                )
+                if token in text
+            )
+            if account_terms >= 2 and action_terms >= 1:
+                _add(
+                    reasons=reasons,
+                    indicators=indicators,
+                    indicator="account_takeover_lure",
+                    reason="The message uses account-security or mailbox language to push the reader into a verification or login action.",
+                )
+
+            if "usaa" in text and any(
+                token in text for token in ("checking", "savings", "authorization", "account update", "urgent profile update")
+            ):
+                _add(
+                    reasons=reasons,
+                    indicators=indicators,
+                    indicator="usaa_account_lure",
+                    reason="The message uses USAA account language that matches a common account-takeover lure.",
+                )
+
+            if "american express" in text and any(
+                token in text for token in ("important new message", "statement", "please read", "account")
+            ):
+                _add(
+                    reasons=reasons,
+                    indicators=indicators,
+                    indicator="amex_account_lure",
+                    reason="The message uses American Express account language that matches a high-risk verification lure.",
                 )
 
             matched = bool(reasons)

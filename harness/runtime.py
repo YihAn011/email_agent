@@ -292,7 +292,7 @@ def build_broader_email_checks_prompt(messages: list[BaseMessage], start_idx: in
         "Continue the same email analysis before giving the final verdict. "
         f"The current tool evidence is incomplete; run these missing checks if possible: {', '.join(missing)}. "
         "Do not classify the email as Spam or Phishing from Rspamd score alone. "
-        "Use URL/content risk, urgency/social-pressure signals, and error-pattern memory as corroborating evidence; include header authentication only if it already ran cleanly. "
+        "Let Rspamd decide the branch: phishing/spoof/url cases need URL and sender corroboration; spam/reputation/BAYES cases need spam-campaign corroboration; urgency is only supporting evidence. "
         "Then answer briefly with the exact template: Email, Type, Verdict, Evidence. "
         "The Verdict must be exactly one of Normal, Spam, Phishing."
     )

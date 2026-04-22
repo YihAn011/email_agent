@@ -266,7 +266,18 @@ case "${START_APP,,}" in
     ;;
   pet|desktop_pet|"")
     echo "[start_full_stack] Launching desktop_pet.py ..."
-    "$PY" "$ROOT/desktop_pet.py" "$@"
+    if "$PY" "$ROOT/desktop_pet.py" "$@"; then
+      :
+    else
+      status=$?
+      if [[ "$status" -eq 139 ]]; then
+        echo "[start_full_stack] desktop_pet.py crashed with SIGSEGV during startup; retrying once ..." >&2
+        sleep 1
+        "$PY" "$ROOT/desktop_pet.py" "$@"
+      else
+        exit "$status"
+      fi
+    fi
     ;;
   *)
     echo "[start_full_stack] ERROR: unknown START_APP='${START_APP}' (use pet or chatbot)." >&2

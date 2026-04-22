@@ -11,6 +11,49 @@ from skills.base_skill import BaseSkill, SkillError, SkillMeta, SkillResult
 
 from .schemas import EmailHeaderAuthCheckInput, EmailHeaderAuthCheckResult, HeaderFinding
 
+COMMON_SECOND_LEVEL_SUFFIXES = {
+    "co.uk",
+    "org.uk",
+    "gov.uk",
+    "ac.uk",
+    "co.jp",
+    "com.au",
+    "net.au",
+    "org.au",
+    "co.nz",
+    "com.br",
+    "com.mx",
+    "co.za",
+}
+FREEMAIL_DOMAINS = {
+    "gmail.com",
+    "googlemail.com",
+    "yahoo.com",
+    "hotmail.com",
+    "outlook.com",
+    "live.com",
+    "aol.com",
+    "icloud.com",
+    "proton.me",
+    "protonmail.com",
+    "gmx.com",
+    "mail.com",
+}
+TRUSTED_BRAND_DOMAINS = {
+    "paypal.com",
+    "microsoft.com",
+    "apple.com",
+    "amazon.com",
+    "google.com",
+    "bankofamerica.com",
+    "chase.com",
+    "wellsfargo.com",
+    "citibank.com",
+    "usaa.com",
+    "americanexpress.com",
+    "amex.com",
+}
+
 
 def _extract_header_block_from_raw_email(raw_email: str) -> str:
     # RFC822 header/body separator is the first blank line.
@@ -40,6 +83,31 @@ def _domain_from_message_id(message_id: str | None) -> str | None:
     return domain or None
 
 
+def _registrable_domain(domain: str | None) -> str | None:
+    if not domain:
+        return None
+    parts = [part for part in domain.strip(".").lower().split(".") if part]
+    if len(parts) < 2:
+        return domain.lower()
+    tail = ".".join(parts[-2:])
+    if len(parts) >= 3 and tail in COMMON_SECOND_LEVEL_SUFFIXES:
+        return ".".join(parts[-3:])
+    return tail
+
+
+def _domains_align(left: str | None, right: str | None) -> bool:
+    return bool(left and right and _registrable_domain(left) == _registrable_domain(right))
+
+
+def _sender_looks_like_brand(text: str) -> str | None:
+    lowered = (text or "").lower()
+    for brand_domain in TRUSTED_BRAND_DOMAINS:
+        brand_name = brand_domain.split(".", 1)[0]
+        if brand_name in lowered or brand_domain in lowered:
+            return brand_domain
+    return None
+
+
 def _parse_authentication_results(headers: list[str]) -> dict[str, str | None]:
     # Extremely lightweight parser: look for "spf=pass", "dkim=fail", etc.
     # Different MTAs format this differently; best-effort only.
@@ -58,7 +126,12 @@ def _basic_risk_and_findings(
     from_domain: str | None,
     reply_to_domain: str | None,
     return_path_domain: str | None,
+    message_id_domain: str | None,
+    dkim_domains: list[str],
+    from_header: str | None,
+    reply_to: str | None,
     auth_results: dict[str, str | None],
+    authentication_header_count: int,
 ) -> tuple[str, list[HeaderFinding], list[str]]:
     findings: list[HeaderFinding] = []
     recommended: list[str] = []
@@ -80,6 +153,57 @@ def _basic_risk_and_findings(
         )
         recommended.append("url_reputation_check")
         recommended.append("llm_phishing_reasoner")
+
+    if reply_to_domain and from_domain and not _domains_align(reply_to_domain, from_domain):
+        findings.append(
+            HeaderFinding(
+                type="reply_to_mismatch",
+                severity="medium",
+                message="Reply-To uses a different organizational domain than From.",
+                evidence={"from_domain": from_domain, "reply_to_domain": reply_to_domain},
+            )
+        )
+
+    if return_path_domain and from_domain and not _domains_align(return_path_domain, from_domain):
+        findings.append(
+            HeaderFinding(
+                type="return_path_mismatch",
+                severity="medium",
+                message="Return-Path uses a different organizational domain than From.",
+                evidence={"from_domain": from_domain, "return_path_domain": return_path_domain},
+            )
+        )
+
+    if message_id_domain and from_domain and not _domains_align(message_id_domain, from_domain):
+        findings.append(
+            HeaderFinding(
+                type="message_id_domain_mismatch",
+                severity="low",
+                message="Message-ID domain does not align with the visible From domain.",
+                evidence={"from_domain": from_domain, "message_id_domain": message_id_domain},
+            )
+        )
+
+    aligned_dkim_domains = [domain for domain in dkim_domains if _domains_align(domain, from_domain)]
+    if dkim_domains and from_domain and not aligned_dkim_domains:
+        findings.append(
+            HeaderFinding(
+                type="dkim_domain_mismatch",
+                severity="medium",
+                message="DKIM signatures are present but none align with the visible From domain.",
+                evidence={"from_domain": from_domain, "dkim_domains": dkim_domains},
+            )
+        )
+
+    if authentication_header_count == 0 and not dkim_domains:
+        findings.append(
+            HeaderFinding(
+                type="missing_authentication_signals",
+                severity="low",
+                message="No Authentication-Results or DKIM signatures were present in the header block.",
+                evidence={"authentication_header_count": authentication_header_count, "dkim_signature_count": len(dkim_domains)},
+            )
+        )
 
     dmarc = auth_results.get("dmarc")
     spf = auth_results.get("spf")
@@ -122,6 +246,30 @@ def _basic_risk_and_findings(
                 severity="medium",
                 message=f"DKIM reported as {dkim}.",
                 evidence={"dkim": dkim},
+            )
+        )
+
+    brand_domain = _sender_looks_like_brand(" ".join(item for item in (from_header, reply_to) if item))
+    if brand_domain:
+        visible_domains = {domain for domain in (from_domain, reply_to_domain, return_path_domain) if domain}
+        if visible_domains and all(not _domains_align(domain, brand_domain) for domain in visible_domains):
+            findings.append(
+                HeaderFinding(
+                    type="brand_impersonation_domain_mismatch",
+                    severity="high",
+                    message="The sender references a well-known brand, but the sender domains do not align with that brand.",
+                    evidence={"brand_domain": brand_domain, "visible_domains": sorted(visible_domains)},
+                )
+            )
+            recommended.append("url_reputation_check")
+
+    if reply_to_domain in FREEMAIL_DOMAINS and from_domain and reply_to_domain != from_domain:
+        findings.append(
+            HeaderFinding(
+                type="freemail_reply_to",
+                severity="medium",
+                message="Reply-To points to a freemail mailbox instead of the visible sender domain.",
+                evidence={"from_domain": from_domain, "reply_to_domain": reply_to_domain},
             )
         )
 
@@ -194,12 +342,23 @@ class EmailHeaderAuthCheckSkill(
                 from_domain=from_domain,
                 reply_to_domain=reply_to_domain,
                 return_path_domain=return_path_domain,
+                message_id_domain=message_id_domain,
+                dkim_domains=sorted(set(dkim_domains)),
+                from_header=from_header,
+                reply_to=reply_to,
                 auth_results=auth_results,
+                authentication_header_count=len(all_auth_headers),
             )
 
             summary_parts: list[str] = []
             if from_domain:
                 summary_parts.append(f"from_domain={from_domain}")
+            if reply_to_domain and reply_to_domain != from_domain:
+                summary_parts.append(f"reply_to_domain={reply_to_domain}")
+            if return_path_domain and return_path_domain != from_domain:
+                summary_parts.append(f"return_path_domain={return_path_domain}")
+            if message_id_domain and message_id_domain != from_domain:
+                summary_parts.append(f"message_id_domain={message_id_domain}")
             if auth_results.get("spf") or auth_results.get("dkim") or auth_results.get("dmarc"):
                 summary_parts.append(
                     "auth="
@@ -214,6 +373,8 @@ class EmailHeaderAuthCheckSkill(
                         if v
                     )
                 )
+            if dkim_domains:
+                summary_parts.append(f"dkim_domains={','.join(sorted(set(dkim_domains))[:3])}")
             summary_parts.append(f"received_count={len(received)}")
             summary = " | ".join(summary_parts) if summary_parts else "Parsed email headers."
 
@@ -286,4 +447,3 @@ class EmailHeaderAuthCheckSkill(
                     endpoint=None,
                 ),
             )
-

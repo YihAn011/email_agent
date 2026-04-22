@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import html
 import json
 import os
+import random
 import re
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from email import policy
 from email.parser import BytesParser
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PySide6.QtCore import (
     QEasingCurve,
@@ -23,6 +26,7 @@ from PySide6.QtCore import (
     QPoint,
     QPropertyAnimation,
     QRect,
+    QRectF,
     QSize,
     Qt,
     QThread,
@@ -37,6 +41,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QGraphicsDropShadowEffect,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -45,9 +50,11 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QScrollArea,
     QAbstractItemView,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QTextBrowser,
     QTextEdit,
@@ -74,10 +81,16 @@ from harness.ui import (
 )
 from skills.error_patterns.schemas import ErrorPatternMemoryCheckInput, ListErrorPatternsInput
 from skills.error_patterns.skill import ErrorPatternMemoryCheckSkill, ListErrorPatternsSkill
+from skills.header_auth.schemas import EmailHeaderAuthCheckInput
+from skills.header_auth.skill import EmailHeaderAuthCheckSkill
+from skills.content_model.schemas import ContentModelCheckInput
+from skills.content_model.skill import ContentModelCheckSkill
 from skills.rspamd.schemas import RspamdScanEmailInput
 from skills.rspamd.skill import RspamdScanEmailSkill
 from skills.scam_indicators.schemas import ScamIndicatorCheckInput
 from skills.scam_indicators.skill import ScamIndicatorCheckSkill
+from skills.spam_campaign.schemas import SpamCampaignCheckInput
+from skills.spam_campaign.skill import SpamCampaignCheckSkill
 from skills.urgency.schemas import UrgencyCheckInput
 from skills.urgency.skill import UrgencyCheckSkill
 from skills.url_reputation.schemas import UrlReputationInput
@@ -100,6 +113,10 @@ EMAIL_PAGE_SIZE = 10
 PUTER_PROVIDER = "puter-openai"
 PUTER_WEB_PORT = 8765
 PUTER_BRIDGE_LOG = "/tmp/email_agent_puter_bridge.log"
+DEVELOPER_RUNS_DIR = PROJECT_ROOT / "dataset" / "reports" / "developer_runs"
+DEVELOPER_SLOT_COUNT = 4
+
+csv.field_size_limit(sys.maxsize)
 
 
 def _child_pids(parent: int) -> list[int]:
@@ -611,20 +628,920 @@ def _email_item_from_raw_text(raw_email: str) -> dict[str, str]:
 
 
 def _extra_checks_strongly_benign(
+    header_data: dict[str, Any],
     url_data: dict[str, Any],
     urgency_data: dict[str, Any],
     memory_data: dict[str, Any],
 ) -> bool:
+    header_risk = str(header_data.get("risk_level") or "").lower()
     url_risk = str(url_data.get("risk_level") or "").lower()
     urgency_risk = str(urgency_data.get("risk_contribution") or "").lower()
     urgency_label = str(urgency_data.get("urgency_label") or "").lower()
     return (
-        url_risk in {"", "low", "unknown"}
+        header_risk in {"", "low", "unknown", "n/a"}
+        and url_risk in {"", "low", "unknown"}
         and not bool(url_data.get("is_suspicious"))
         and urgency_risk in {"", "low", "unknown"}
         and urgency_label in {"", "not urgent", "unknown"}
         and not bool(memory_data.get("matched"))
     )
+
+
+def _developer_routed_skills(
+    *,
+    rspamd_data: dict[str, Any],
+    subject: str,
+    from_address: str,
+    email_text: str,
+) -> list[str]:
+    recommended = [str(item) for item in (rspamd_data.get("recommended_next_skills") or []) if item]
+    text = f"{subject} {from_address} {email_text}".lower()
+    categories = {str(item).lower() for item in (rspamd_data.get("categories") or [])}
+    score = float(rspamd_data.get("score") or 0.0)
+
+    if any(
+        token in text
+        for token in (
+            "mailbox",
+            "account",
+            "verification",
+            "verify",
+            "password",
+            "help desk",
+            "suspension",
+            "suspended",
+            "security alert",
+            "unusual activity",
+            "usaa",
+            "american express",
+        )
+    ):
+        recommended.extend(
+            [
+                "email_header_auth_check",
+                "scam_indicator_check",
+                "url_reputation_check",
+                "urgency_check",
+            ]
+        )
+
+    if score >= 7:
+        recommended.extend(
+            [
+                "content_model_check",
+                "email_header_auth_check",
+                "scam_indicator_check",
+                "spam_campaign_check",
+                "url_reputation_check",
+                "urgency_check",
+                "list_error_patterns",
+            ]
+        )
+    if score >= 10 or categories & {"phishing", "spoofing", "suspicious_links"}:
+        recommended.append("error_pattern_memory_check")
+    if email_text.strip():
+        recommended.insert(0, "content_model_check")
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in recommended:
+        if item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
+
+
+def _developer_dataset_paths() -> list[Path]:
+    candidates: list[Path] = []
+    for base in (PROJECT_ROOT / "database", PROJECT_ROOT / "dataset" / "processed", PROJECT_ROOT / "dataset" / "raw"):
+        if not base.exists():
+            continue
+        candidates.extend(sorted(base.glob("*.csv")))
+    return candidates
+
+
+def _developer_dataset_summary(path: Path) -> dict[str, Any]:
+    sources: set[str] = set()
+    labels: set[str] = set()
+    row_count = 0
+    with path.open(newline="", encoding="utf-8", errors="ignore") as handle:
+        reader = csv.DictReader(handle)
+        fields = reader.fieldnames or []
+        for row in reader:
+            row_count += 1
+            if row.get("source"):
+                sources.add(str(row["source"]))
+            if row.get("normalized_label"):
+                labels.add(str(row["normalized_label"]))
+            elif row.get("binary_label") not in (None, ""):
+                labels.add(str(row["binary_label"]))
+            if row_count >= 5000 and sources and labels:
+                # Keep UI refresh responsive; exact row count is not needed for setup.
+                break
+    return {
+        "name": path.name,
+        "path": str(path),
+        "row_count": row_count,
+        "row_count_is_sampled": row_count >= 5000,
+        "sources": sorted(sources),
+        "labels": sorted(labels),
+        "fields": fields,
+    }
+
+
+def _developer_preset_dataset(summary: dict[str, Any], *, name: str, preset_sources: list[str]) -> dict[str, Any]:
+    item = dict(summary)
+    item["name"] = name
+    item["preset_sources"] = list(preset_sources)
+    item["source_filter_mode"] = "preset_only"
+    return item
+
+
+def _developer_load_rows(
+    path: Path,
+    *,
+    sources: set[str],
+    limit: int,
+    offset: int,
+    sample_mode: str = "Sequential",
+    seed: int = 42,
+) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    with path.open(newline="", encoding="utf-8", errors="ignore") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            if sources and str(row.get("source", "")) not in sources:
+                continue
+            candidates.append(row)
+
+    mode = sample_mode.strip().lower()
+    if mode == "spam only":
+        candidates = [row for row in candidates if _developer_actual_binary(row) == 1]
+    elif mode == "ham only":
+        candidates = [row for row in candidates if _developer_actual_binary(row) == 0]
+    elif mode == "balanced 50/50 ham/spam":
+        spam_rows = [row for row in candidates if _developer_actual_binary(row) == 1]
+        ham_rows = [row for row in candidates if _developer_actual_binary(row) == 0]
+        rng = random.Random(seed)
+        rng.shuffle(spam_rows)
+        rng.shuffle(ham_rows)
+        spam_target = limit // 2 if limit else min(len(spam_rows), len(ham_rows))
+        ham_target = limit - spam_target if limit else spam_target
+        candidates = []
+        for pair_idx in range(max(spam_target, ham_target)):
+            if pair_idx < spam_target and pair_idx < len(spam_rows):
+                candidates.append(spam_rows[pair_idx])
+            if pair_idx < ham_target and pair_idx < len(ham_rows):
+                candidates.append(ham_rows[pair_idx])
+    elif mode == "random":
+        rng = random.Random(seed)
+        rng.shuffle(candidates)
+
+    if offset:
+        candidates = candidates[offset:]
+    if limit:
+        candidates = candidates[:limit]
+    return candidates
+
+
+def _developer_actual_binary(row: dict[str, str]) -> int | None:
+    value = str(row.get("binary_label", "")).strip()
+    if value in {"0", "1"}:
+        return int(value)
+    label = str(row.get("normalized_label") or row.get("source_label") or "").strip().lower()
+    if label in {"legitimate", "benign", "ham", "normal", "0"}:
+        return 0
+    if label in {"spam", "phishing", "fraud", "malicious", "1"}:
+        return 1
+    return None
+
+
+def _developer_metric_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    counts = {"tp": 0, "tn": 0, "fp": 0, "fn": 0, "invalid": 0}
+    llm_success = 0
+    llm_errors = 0
+    for record in records:
+        actual = record.get("actual_binary")
+        pred = record.get("predicted_binary")
+        if bool(record.get("llm_review_used")):
+            llm_success += 1
+        if str(record.get("llm_review_error") or "").strip():
+            llm_errors += 1
+        if actual not in {0, 1} or pred not in {0, 1}:
+            counts["invalid"] += 1
+        elif actual == 1 and pred == 1:
+            counts["tp"] += 1
+        elif actual == 0 and pred == 0:
+            counts["tn"] += 1
+        elif actual == 0 and pred == 1:
+            counts["fp"] += 1
+        elif actual == 1 and pred == 0:
+            counts["fn"] += 1
+    valid = counts["tp"] + counts["tn"] + counts["fp"] + counts["fn"]
+    negatives = counts["tn"] + counts["fp"]
+    positives = counts["tp"] + counts["fn"]
+    predicted_positive = counts["tp"] + counts["fp"]
+    return {
+        **counts,
+        "total": valid + counts["invalid"],
+        "valid": valid,
+        "accuracy": (counts["tp"] + counts["tn"]) / valid if valid else None,
+        "fpr": counts["fp"] / negatives if negatives else None,
+        "recall": counts["tp"] / positives if positives else None,
+        "precision": counts["tp"] / predicted_positive if predicted_positive else None,
+        "f1": (2 * counts["tp"] / (2 * counts["tp"] + counts["fp"] + counts["fn"])) if (2 * counts["tp"] + counts["fp"] + counts["fn"]) else None,
+        "fnr": counts["fn"] / positives if positives else None,
+        "llm_success": llm_success,
+        "llm_errors": llm_errors,
+        "llm_attempts": llm_success + llm_errors,
+    }
+
+
+def _developer_format_metric(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    return str(value)
+
+
+def _developer_build_raw_email(row: dict[str, str]) -> str:
+    sender = (row.get("sender") or "unknown@example.com").replace("\n", " ").replace("\r", " ")
+    receiver = (row.get("receiver") or "recipient@example.com").replace("\n", " ").replace("\r", " ")
+    subject = (row.get("subject") or "(no subject)").replace("\n", " ").replace("\r", " ")
+    body = row.get("email_text") or ""
+    return f"From: {sender}\nTo: {receiver}\nSubject: {subject}\nMIME-Version: 1.0\nContent-Type: text/plain; charset=utf-8\n\n{body}"
+
+
+def _developer_gray_zone_reasons(
+    *,
+    decision: str,
+    rspamd_data: dict[str, Any],
+    content_data: dict[str, Any],
+    header_data: dict[str, Any],
+    url_data: dict[str, Any],
+    urgency_data: dict[str, Any],
+    scam_data: dict[str, Any],
+    campaign_data: dict[str, Any],
+) -> list[str]:
+    reasons: list[str] = []
+    score = float(content_data.get("malicious_score") or 0.0)
+    threshold = float(content_data.get("threshold") or 0.5)
+    rspamd_score = float(rspamd_data.get("score") or 0.0)
+    header_risk = str(header_data.get("risk_level") or "").lower()
+    url_risk = str(url_data.get("risk_level") or "").lower()
+    urgency_risk = str(urgency_data.get("risk_contribution") or "").lower()
+    scam_matched = bool(scam_data.get("matched"))
+    campaign_matched = bool(campaign_data.get("matched"))
+    content_malicious = bool(content_data.get("is_malicious"))
+    content_margin = abs(score - threshold)
+    phish_signals = sum(
+        1
+        for condition in (
+            header_risk in {"medium", "high"},
+            url_risk in {"medium", "high"} or bool(url_data.get("is_suspicious")),
+            scam_matched,
+            urgency_risk in {"medium", "high"} or bool(urgency_data.get("is_urgent")),
+        )
+        if condition
+    )
+
+    if not content_data:
+        reasons.append("content-model-missing")
+    elif content_margin <= 0.18:
+        reasons.append("content-near-threshold")
+    if decision == "Normal" and (rspamd_score >= 8.0 or phish_signals >= 2 or campaign_matched):
+        reasons.append("normal-vs-risk-signals-conflict")
+    if decision == "Spam" and phish_signals >= 2:
+        reasons.append("spam-vs-phishing-conflict")
+    if decision == "Phishing" and phish_signals <= 1 and rspamd_score < 8.0 and not content_malicious:
+        reasons.append("phishing-weak-corroboration")
+    if decision != "Normal" and not content_malicious and rspamd_score < 6.0 and not campaign_matched and not scam_matched:
+        reasons.append("malicious-with-weak-core-evidence")
+    if decision == "Normal" and content_malicious and rspamd_score >= 6.0:
+        reasons.append("content-vs-final-decision-conflict")
+    return reasons
+
+
+def _developer_parse_llm_verdict(text: str) -> tuple[str | None, str]:
+    cleaned = text.strip()
+    if not cleaned:
+        return None, ""
+    payload_text = cleaned
+    if "{" in cleaned and "}" in cleaned:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        payload_text = cleaned[start : end + 1]
+    rationale = ""
+    try:
+        payload = json.loads(payload_text)
+        verdict = str(payload.get("verdict") or "").strip().title()
+        rationale = str(payload.get("reason") or payload.get("rationale") or "").strip()
+        if verdict in {"Normal", "Spam", "Phishing"}:
+            return verdict, rationale
+    except Exception:
+        pass
+    lowered = cleaned.lower()
+    if "phishing" in lowered:
+        return "Phishing", rationale
+    if '"spam"' in lowered or re.search(r"\bspam\b", lowered):
+        return "Spam", rationale
+    if "normal" in lowered or "benign" in lowered:
+        return "Normal", rationale
+    return None, rationale
+
+
+def _developer_build_llm_review_prompt(
+    *,
+    raw_email: str,
+    current_decision: str,
+    gray_reasons: list[str],
+    signal_summary: dict[str, Any],
+) -> str:
+    return (
+        "You are the final review layer for an email security benchmark.\n"
+        "Your top priority is minimizing false positives. Incorrectly flagging a legitimate email is worse than missing an ordinary spam email.\n"
+        "A deterministic classifier already produced an initial verdict. Preserve that verdict unless there is strong, specific, and corroborated evidence that it is wrong.\n"
+        "Be conservative. Ambiguous, mixed, or weak evidence must keep the current verdict.\n"
+        "Do not upgrade a message to Spam or Phishing based on tone, marketing language, branding, urgency, or a single suspicious clue alone.\n"
+        "Only change Normal to Spam/Phishing when multiple independent signals agree and there is no reasonable benign explanation.\n"
+        "Only change Spam to Phishing when there is clear evidence of impersonation, credential theft, payment fraud, or malicious account-action pressure.\n"
+        "If the evidence is mixed or uncertain, return the current verdict unchanged.\n"
+        "Return JSON only with keys verdict, confidence, reason.\n"
+        'Allowed verdict values: "Normal", "Spam", "Phishing".\n\n'
+        f"Initial verdict: {current_decision}\n"
+        f"Why this email was sent to final review: {', '.join(gray_reasons) or 'gray-zone'}\n"
+        f"Existing signals: {json.dumps(signal_summary, ensure_ascii=False)}\n\n"
+        "Raw email follows:\n"
+        f"{raw_email}"
+    )
+
+
+async def _developer_llm_review_async(
+    *,
+    provider: str,
+    model: str,
+    rspamd_base_url: str,
+    ollama_base_url: str,
+    raw_email: str,
+    current_decision: str,
+    gray_reasons: list[str],
+    signal_summary: dict[str, Any],
+) -> dict[str, Any]:
+    runtime = EmailAgentRuntime(
+        provider=provider,
+        model_name=model,
+        rspamd_base_url=rspamd_base_url,
+        ollama_base_url=ollama_base_url,
+        show_messages=False,
+    )
+    await runtime.setup()
+    prompt = _developer_build_llm_review_prompt(
+        raw_email=raw_email,
+        current_decision=current_decision,
+        gray_reasons=gray_reasons,
+        signal_summary=signal_summary,
+    )
+    messages, start_idx = await runtime.ask(prompt)
+    text = latest_ai_message(messages).strip() or render_chat_response(messages, start_idx)
+    verdict, rationale = _developer_parse_llm_verdict(text)
+    return {
+        "ok": verdict in {"Normal", "Spam", "Phishing"},
+        "verdict": verdict,
+        "reason": rationale,
+        "raw_text": text,
+    }
+
+
+def _developer_predict_row(
+    row: dict[str, str],
+    *,
+    rspamd_base_url: str,
+    provider: str = "",
+    model: str = "",
+    ollama_base_url: str = "",
+    llm_review_enabled: bool = False,
+    puter_review_func: Callable[[str, str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    raw_email = _developer_build_raw_email(row)
+    subject = row.get("subject", "")
+    from_address = row.get("sender", "")
+    email_text = row.get("email_text", "")
+    rspamd_result = RspamdScanEmailSkill(base_url=rspamd_base_url).run(
+        RspamdScanEmailInput(raw_email=raw_email, include_raw_result=False)
+    )
+    rspamd_data = rspamd_result.data.model_dump() if rspamd_result.ok and rspamd_result.data else {}
+    rspamd_score = float(rspamd_data.get("score") or 0.0)
+    tools_called = ["rspamd_scan_email"]
+    content_data: dict[str, Any] = {}
+    header_data: dict[str, Any] = {}
+    url_data: dict[str, Any] = {}
+    urgency_data: dict[str, Any] = {}
+    scam_data: dict[str, Any] = {}
+    campaign_data: dict[str, Any] = {}
+    memory_data: dict[str, Any] = {}
+    patterns_count = None
+    routed_skills = _developer_routed_skills(
+        rspamd_data=rspamd_data,
+        subject=subject,
+        from_address=from_address,
+        email_text=email_text,
+    )
+
+    if "content_model_check" in routed_skills:
+        content_result = ContentModelCheckSkill().run(
+            ContentModelCheckInput(
+                email_text=email_text,
+                subject=subject,
+                from_address=from_address,
+                sender_domain=row.get("sender_domain", ""),
+                content_types=row.get("content_types", ""),
+            )
+        )
+        tools_called.append("content_model_check")
+        content_data = content_result.data.model_dump() if content_result.ok and content_result.data else {}
+
+    if "email_header_auth_check" in routed_skills:
+        header_result = EmailHeaderAuthCheckSkill().run(
+            EmailHeaderAuthCheckInput(raw_email=raw_email, include_raw_headers=False)
+        )
+        tools_called.append("email_header_auth_check")
+        header_data = header_result.data.model_dump() if header_result.ok and header_result.data else {}
+
+    if "scam_indicator_check" in routed_skills:
+        scam_result = ScamIndicatorCheckSkill().run(
+            ScamIndicatorCheckInput(raw_email=raw_email, subject=subject, from_address=from_address)
+        )
+        tools_called.append("scam_indicator_check")
+        scam_data = scam_result.data.model_dump() if scam_result.ok and scam_result.data else {}
+
+    if "spam_campaign_check" in routed_skills:
+        campaign_result = SpamCampaignCheckSkill().run(
+            SpamCampaignCheckInput(
+                raw_email=raw_email,
+                email_text=email_text,
+                subject=subject,
+                from_address=from_address,
+            )
+        )
+        tools_called.append("spam_campaign_check")
+        campaign_data = campaign_result.data.model_dump() if campaign_result.ok and campaign_result.data else {}
+
+    if "url_reputation_check" in routed_skills:
+        url_result = UrlReputationSkill().run(UrlReputationInput(email_text=email_text, subject=subject))
+        tools_called.append("url_reputation_check")
+        url_data = url_result.data.model_dump() if url_result.ok and url_result.data else {}
+
+    if "urgency_check" in routed_skills:
+        urgency_result = UrgencyCheckSkill().run(UrgencyCheckInput(email_text=email_text, subject=subject))
+        tools_called.append("urgency_check")
+        urgency_data = urgency_result.data.model_dump() if urgency_result.ok and urgency_result.data else {}
+
+    if "list_error_patterns" in routed_skills:
+        patterns_result = ListErrorPatternsSkill().run(ListErrorPatternsInput(limit=20))
+        tools_called.append("list_error_patterns")
+        if patterns_result.ok and patterns_result.data:
+            patterns_count = len(patterns_result.data.entries)
+
+    obvious_reasons = list(scam_data.get("reasons") or [])
+    campaign_reasons = list(campaign_data.get("reasons") or [])
+    decision = _required_decision_label(
+        rspamd_data,
+        content_data or None,
+        header_data or None,
+        url_data or None,
+        urgency_data or None,
+        scam_data or None,
+        campaign_data or None,
+        subject,
+        from_address,
+    )
+    if campaign_reasons and decision == "Normal":
+        decision = "Spam"
+    if "error_pattern_memory_check" in routed_skills:
+        current_verdict = "benign" if decision == "Normal" else "suspicious"
+        memory_result = ErrorPatternMemoryCheckSkill().run(
+            ErrorPatternMemoryCheckInput(
+                subject=subject,
+                from_address=from_address,
+                current_verdict=current_verdict,
+                rspamd_risk_level=str(rspamd_data.get("risk_level") or "") or None,
+                header_risk_level=str(header_data.get("risk_level") or "") or None,
+                urgency_label=str(urgency_data.get("urgency_label") or "") or None,
+                url_risk_level=str(url_data.get("risk_level") or "") or None,
+            )
+        )
+        tools_called.append("error_pattern_memory_check")
+        memory_data = memory_result.data.model_dump() if memory_result.ok and memory_result.data else {}
+        if not obvious_reasons and not campaign_reasons and memory_data.get("matched") and memory_data.get("suggested_verdict") == "benign":
+            decision = "Normal"
+        if (
+            not obvious_reasons
+            and not campaign_reasons
+            and rspamd_score > 10
+            and decision == "Normal"
+            and not _extra_checks_strongly_benign(header_data, url_data, urgency_data, memory_data)
+        ):
+            decision = "Spam"
+    if content_data:
+        if not bool(content_data.get("is_malicious")) and decision != "Phishing":
+            decision = "Normal"
+        elif bool(content_data.get("is_malicious")) and decision != "Phishing":
+            decision = "Spam"
+
+    llm_review_used = False
+    llm_review_decision = ""
+    llm_review_reason = ""
+    llm_review_error = ""
+    gray_reasons = _developer_gray_zone_reasons(
+        decision=decision,
+        rspamd_data=rspamd_data,
+        content_data=content_data,
+        header_data=header_data,
+        url_data=url_data,
+        urgency_data=urgency_data,
+        scam_data=scam_data,
+        campaign_data=campaign_data,
+    )
+    if llm_review_enabled and provider and model and gray_reasons:
+        signal_summary = {
+            "rspamd_score": rspamd_score,
+            "rspamd_action": rspamd_data.get("action"),
+            "rspamd_risk": rspamd_data.get("risk_level"),
+            "content_score": content_data.get("malicious_score"),
+            "content_threshold": content_data.get("threshold"),
+            "content_risk": content_data.get("risk_level"),
+            "header_risk": header_data.get("risk_level"),
+            "url_risk": url_data.get("risk_level"),
+            "url_suspicious": url_data.get("is_suspicious"),
+            "urgency_label": urgency_data.get("urgency_label"),
+            "scam_matched": scam_data.get("matched"),
+            "spam_campaign_matched": campaign_data.get("matched"),
+            "scam_reasons": obvious_reasons,
+            "campaign_reasons": campaign_reasons,
+        }
+        try:
+            if provider == PUTER_PROVIDER and puter_review_func is not None:
+                prompt = _developer_build_llm_review_prompt(
+                    raw_email=raw_email,
+                    current_decision=decision,
+                    gray_reasons=gray_reasons,
+                    signal_summary=signal_summary,
+                )
+                llm_review = puter_review_func(prompt, model)
+            else:
+                llm_review = asyncio.run(
+                    _developer_llm_review_async(
+                        provider=provider,
+                        model=model,
+                        rspamd_base_url=rspamd_base_url,
+                        ollama_base_url=ollama_base_url,
+                        raw_email=raw_email,
+                        current_decision=decision,
+                        gray_reasons=gray_reasons,
+                        signal_summary=signal_summary,
+                    )
+                )
+        except Exception as exc:
+            llm_review = {"ok": False, "verdict": None, "reason": str(exc), "raw_text": ""}
+        if not llm_review.get("ok"):
+            llm_review_error = str(llm_review.get("reason") or "LLM final review did not return a valid verdict.")
+        if llm_review.get("ok") and llm_review.get("verdict") in {"Normal", "Spam", "Phishing"}:
+            llm_review_used = True
+            llm_review_decision = str(llm_review.get("verdict") or "")
+            llm_review_reason = str(llm_review.get("reason") or "")
+            decision = llm_review_decision
+            tools_called.append("llm_final_review")
+
+    predicted_binary = 0 if decision == "Normal" else 1
+    actual_binary = _developer_actual_binary(row)
+    return {
+        "source": row.get("source", ""),
+        "source_record_id": row.get("source_record_id", ""),
+        "subject": subject,
+        "sender": from_address,
+        "actual_binary": actual_binary,
+        "actual_label": row.get("normalized_label", ""),
+        "predicted_verdict": decision,
+        "predicted_binary": predicted_binary,
+        "rspamd_score": rspamd_score,
+        "rspamd_risk_level": rspamd_data.get("risk_level"),
+        "content_score": content_data.get("malicious_score"),
+        "content_risk_level": content_data.get("risk_level"),
+        "content_threshold": content_data.get("threshold"),
+        "header_risk_level": header_data.get("risk_level"),
+        "url_risk_level": url_data.get("risk_level"),
+        "url_score": url_data.get("phishing_score"),
+        "urgency_label": urgency_data.get("urgency_label"),
+        "urgency_score": urgency_data.get("urgency_score"),
+        "scam_indicators": scam_data.get("indicators") or [],
+        "scam_reasons": obvious_reasons,
+        "spam_campaign_indicators": campaign_data.get("indicators") or [],
+        "spam_campaign_reasons": campaign_reasons,
+        "gray_zone_reasons": gray_reasons,
+        "llm_review_used": llm_review_used,
+        "llm_review_decision": llm_review_decision,
+        "llm_review_reason": llm_review_reason,
+        "llm_review_error": llm_review_error,
+        "patterns_checked": patterns_count,
+        "tools_called": tools_called,
+        "flow": "content_model_ifelse_no_llm_v1",
+    }
+
+
+class DeveloperExperimentWorker(QObject):
+    progress = Signal(int, int)
+    log = Signal(str)
+    puter_review_requested = Signal(object)
+    metrics_ready = Signal(object)
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__()
+        self.config = config
+        self._stop_requested = False
+
+    def request_stop(self) -> None:
+        self._stop_requested = True
+
+    def _request_puter_review(self, prompt: str, model: str) -> dict[str, Any]:
+        event = threading.Event()
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "model": model,
+            "event": event,
+            "result": None,
+            "attempt": 1,
+            "max_attempts": 3,
+        }
+        self.puter_review_requested.emit(payload)
+        if not event.wait(timeout=180):
+            return {
+                "ok": False,
+                "verdict": None,
+                "reason": "Timed out waiting for Puter bridge final review.",
+                "raw_text": "",
+            }
+        result = payload.get("result")
+        if isinstance(result, dict):
+            return result
+        return {
+            "ok": False,
+            "verdict": None,
+            "reason": "Puter bridge final review returned no result.",
+            "raw_text": "",
+        }
+
+    def run(self) -> None:
+        try:
+            path = Path(self.config["dataset_path"])
+            limit = int(self.config.get("limit") or 0)
+            offset = int(self.config.get("offset") or 0)
+            sources = set(self.config.get("sources") or [])
+            sample_mode = str(self.config.get("sample_mode") or "Sequential")
+            seed = int(self.config.get("seed") or 42)
+            run_dir = Path(self.config["run_dir"])
+            run_dir.mkdir(parents=True, exist_ok=True)
+            results_path = run_dir / "results.jsonl"
+            metrics_path = run_dir / "metrics.json"
+            log_path = run_dir / "log.txt"
+            config_path = run_dir / "config.json"
+            config_path.write_text(json.dumps(self.config, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            rows = _developer_load_rows(
+                path,
+                sources=sources,
+                limit=limit,
+                offset=offset,
+                sample_mode=sample_mode,
+                seed=seed,
+            )
+            total = len(rows)
+            llm_success_count = 0
+            llm_error_count = 0
+            self.log.emit(
+                f"Loaded {total} row(s) from {path.name}; mode={sample_mode}; "
+                f"offset={offset}; sources={sorted(sources) or 'all'}"
+            )
+            records: list[dict[str, Any]] = []
+            with results_path.open("a", encoding="utf-8") as out, log_path.open("a", encoding="utf-8") as log_handle:
+                for idx, row in enumerate(rows, 1):
+                    if self._stop_requested:
+                        self.log.emit(f"Stop requested at row {idx - 1}/{total}. Resume will start from index {offset + idx - 1}.")
+                        break
+                    record = _developer_predict_row(
+                        row,
+                        rspamd_base_url=str(self.config.get("rspamd_base_url") or DEFAULT_BASE_URL),
+                        provider=str(self.config.get("provider") or ""),
+                        model=str(self.config.get("model") or ""),
+                        ollama_base_url=str(self.config.get("ollama_base_url") or ""),
+                        llm_review_enabled=False,
+                        puter_review_func=self._request_puter_review,
+                    )
+                    record["run_index"] = offset + idx
+                    record["model_provider"] = self.config.get("provider")
+                    record["model_name"] = self.config.get("model")
+                    records.append(record)
+                    if bool(record.get("llm_review_used")):
+                        llm_success_count += 1
+                    if str(record.get("llm_review_error") or "").strip():
+                        llm_error_count += 1
+                    line = json.dumps(record, ensure_ascii=False)
+                    out.write(line + "\n")
+                    out.flush()
+                    log_handle.write(
+                        f"[{idx}/{total}] actual={record['actual_binary']} pred={record['predicted_binary']} "
+                        f"score={record['rspamd_score']} llm_review={record.get('llm_review_used')} "
+                        f"llm_success={llm_success_count} llm_errors={llm_error_count} "
+                        f"llm_error={record.get('llm_review_error') or ''} "
+                        f"subject={record['subject'][:80]}\n"
+                    )
+                    log_handle.flush()
+                    if idx == 1 or idx % 5 == 0 or idx == total:
+                        metrics = _developer_metric_summary(records)
+                        metrics_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
+                        self.metrics_ready.emit(metrics)
+                    self.progress.emit(idx, total)
+            metrics = _developer_metric_summary(records)
+            metrics_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
+            self.metrics_ready.emit(metrics)
+            self.finished.emit(str(run_dir))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class DeveloperMetricCard(QWidget):
+    def __init__(self, slot_idx: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.slot_idx = slot_idx
+        self._metrics: dict[str, Any] = {}
+        self.setMinimumHeight(170)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_metrics(self, metrics: dict[str, Any]) -> None:
+        self._metrics = dict(metrics)
+        self.update()
+
+    def paintEvent(self, event: Any) -> None:
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        painter.setPen(QPen(QColor("#cbd5e1"), 1))
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawRoundedRect(rect, 12, 12)
+
+        accent_colors = ["#16697a", "#f59e0b", "#2563eb", "#dc2626"]
+        accent = QColor(accent_colors[self.slot_idx % len(accent_colors)])
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(accent)
+        painter.drawRoundedRect(QRectF(rect.left(), rect.top(), 7, rect.height()), 3, 3)
+
+        title_font = QFont(painter.font())
+        title_font.setPointSize(11)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.setPen(QColor("#0f172a"))
+        painter.drawText(QRectF(rect.left() + 18, rect.top() + 10, 120, 22), Qt.AlignLeft | Qt.AlignVCenter, f"Test {self.slot_idx + 1}")
+
+        total = self._metrics.get("total")
+        total_text = f"Total {int(total)}" if isinstance(total, (int, float)) else "Waiting"
+        pill_rect = QRectF(rect.right() - 96, rect.top() + 10, 78, 24)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#eef3f7"))
+        painter.drawRoundedRect(pill_rect, 12, 12)
+        label_font = QFont(painter.font())
+        label_font.setPointSize(8)
+        label_font.setBold(True)
+        painter.setFont(label_font)
+        painter.setPen(QColor("#475569"))
+        painter.drawText(pill_rect, Qt.AlignCenter, total_text)
+
+        rows = [
+            ("accuracy", "Accuracy", QColor("#16697a"), False, 1.0),
+            ("fpr", "FPR", QColor("#dc2626"), True, 0.2),
+            ("recall", "Recall", QColor("#2563eb"), False, 1.0),
+            ("precision", "Precision", QColor("#0f766e"), False, 1.0),
+            ("f1", "F1", QColor("#7c3aed"), False, 1.0),
+        ]
+        y = rect.top() + 46
+        bar_left = rect.left() + 88
+        bar_right = rect.right() - 18
+        bar_width = max(20.0, bar_right - bar_left)
+        painter.setFont(label_font)
+        for key, label, color, lower_is_better, scale_max in rows:
+            raw = self._metrics.get(key)
+            value = float(raw) if isinstance(raw, (int, float)) else None
+            display = _developer_format_metric(value)
+            fill_ratio = 0.0
+            if value is not None:
+                normalized = max(0.0, min(1.0, value / scale_max))
+                fill_ratio = 1.0 - normalized if lower_is_better else normalized
+
+            painter.setPen(QColor("#334155"))
+            painter.drawText(QRectF(rect.left() + 18, y - 1, 64, 18), Qt.AlignLeft | Qt.AlignVCenter, label)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#e2e8f0"))
+            track = QRectF(bar_left, y + 2, bar_width, 11)
+            painter.drawRoundedRect(track, 5, 5)
+            if fill_ratio > 0:
+                painter.setBrush(color)
+                painter.drawRoundedRect(QRectF(track.left(), track.top(), track.width() * fill_ratio, track.height()), 5, 5)
+            painter.setPen(QColor("#0f172a"))
+            painter.drawText(QRectF(bar_right - 45, y - 1, 45, 18), Qt.AlignRight | Qt.AlignVCenter, display)
+            y += 22
+
+
+class DeveloperMetricsChart(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._slot_metrics: dict[int, dict[str, Any]] = {}
+        self.setMinimumHeight(260)
+
+    def set_slot_metrics(self, slot_metrics: dict[int, dict[str, Any]]) -> None:
+        self._slot_metrics = {idx: dict(metrics) for idx, metrics in slot_metrics.items() if isinstance(metrics, dict)}
+        self.update()
+
+    def paintEvent(self, event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+
+        outer = self.rect().adjusted(12, 12, -12, -12)
+        painter.setPen(QPen(QColor("#cbd5e1"), 1))
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawRoundedRect(outer, 12, 12)
+
+        title_rect = QRectF(outer.left() + 12, outer.top() + 8, outer.width() - 24, 28)
+        painter.setPen(QColor("#0f172a"))
+        title_font = QFont(painter.font())
+        title_font.setPointSize(12)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.drawText(title_rect, Qt.AlignLeft | Qt.AlignVCenter, "Metric Comparison")
+
+        metrics = [
+            ("accuracy", "Accuracy", 1.0, False),
+            ("recall", "Recall", 1.0, False),
+            ("precision", "Precision", 1.0, False),
+            ("fpr", "FPR", 0.2, True),
+        ]
+        colors = ["#16697a", "#f59e0b", "#2563eb", "#dc2626"]
+        chart_top = outer.top() + 54
+        chart_bottom = outer.bottom() - 72
+        chart_height = chart_bottom - chart_top
+        group_width = outer.width() / max(1, len(metrics))
+        bar_width = max(12.0, min(28.0, group_width / 6.0))
+
+        axis_pen = QPen(QColor("#cbd5e1"), 1)
+        label_font = QFont(painter.font())
+        label_font.setPointSize(9)
+        painter.setFont(label_font)
+
+        for group_idx, (metric_key, metric_label, scale_max, invert) in enumerate(metrics):
+            group_left = outer.left() + group_idx * group_width
+            baseline_y = chart_bottom
+            painter.setPen(axis_pen)
+            painter.drawLine(int(group_left + 20), int(baseline_y), int(group_left + group_width - 10), int(baseline_y))
+            painter.setPen(QColor("#475569"))
+            painter.drawText(
+                QRectF(group_left + 6, chart_bottom + 6, group_width - 12, 18),
+                Qt.AlignCenter,
+                metric_label,
+            )
+            for slot_idx in range(DEVELOPER_SLOT_COUNT):
+                metrics_for_slot = self._slot_metrics.get(slot_idx, {})
+                raw_value = metrics_for_slot.get(metric_key)
+                if raw_value is None:
+                    continue
+                value = float(raw_value)
+                normalized = max(0.0, min(1.0, value / scale_max))
+                if invert:
+                    normalized = 1.0 - normalized
+                bar_height = normalized * (chart_height - 28)
+                x = group_left + 30 + slot_idx * (bar_width + 8)
+                y = baseline_y - bar_height
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(colors[slot_idx % len(colors)]))
+                painter.drawRoundedRect(QRectF(x, y, bar_width, bar_height), 4, 4)
+                painter.setPen(QColor("#334155"))
+                painter.drawText(
+                    QRectF(x - 10, y - 18, bar_width + 20, 16),
+                    Qt.AlignCenter,
+                    f"{value:.3f}",
+                )
+
+        legend_y = outer.bottom() - 34
+        painter.setFont(label_font)
+        for slot_idx in range(DEVELOPER_SLOT_COUNT):
+            x = outer.left() + 20 + slot_idx * 110
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(colors[slot_idx % len(colors)]))
+            painter.drawRoundedRect(QRectF(x, legend_y, 14, 14), 3, 3)
+            painter.setPen(QColor("#334155"))
+            painter.drawText(QRectF(x + 20, legend_y - 1, 80, 18), Qt.AlignLeft | Qt.AlignVCenter, f"Test {slot_idx + 1}")
 
 
 def _direct_email_analysis(
@@ -670,52 +1587,97 @@ def _direct_email_analysis(
         )
         rspamd_data = rspamd_result.data.model_dump() if rspamd_result.ok and rspamd_result.data else {}
         rspamd_score = float(rspamd_data.get("score") or 0.0)
-        run_extra_tools = rspamd_score > rspamd_spam_threshold
+        routed_skills = _developer_routed_skills(
+            rspamd_data=rspamd_data,
+            subject=subject,
+            from_address=from_address,
+            email_text=_mail_body_text(raw_email.encode("utf-8", errors="replace")) or raw_email,
+        )
+        run_extra_tools = bool(routed_skills)
+        header_result = None
         url_result = None
         urgency_result = None
         patterns_result = None
         memory_result = None
         scam_result = None
+        campaign_result = None
+        content_result = None
+        content_data: dict[str, Any] = {}
+        header_data: dict[str, Any] = {}
         scam_data: dict[str, Any] = {}
+        campaign_data: dict[str, Any] = {}
         obvious_phishing_reasons: list[str] = []
+        campaign_reasons: list[str] = []
         url_data: dict[str, Any] = {}
         urgency_data: dict[str, Any] = {}
 
         if run_extra_tools:
             body_text = _mail_body_text(raw_email.encode("utf-8", errors="replace")) or raw_email
-            progress.emit("Rspamd score is above 7; running additional MCP tools")
-            progress.emit("Checking obvious scam indicators")
-            scam_result = ScamIndicatorCheckSkill().run(
-                ScamIndicatorCheckInput(
-                    raw_email=raw_email,
-                    subject=subject,
-                    from_address=from_address,
+            progress.emit("Routing follow-up checks from the Rspamd result")
+            if "content_model_check" in routed_skills:
+                progress.emit("Running calibrated content classifier")
+                content_result = ContentModelCheckSkill().run(
+                    ContentModelCheckInput(
+                        email_text=body_text,
+                        subject=subject,
+                        from_address=from_address,
+                    )
                 )
-            )
-            scam_data = scam_result.data.model_dump() if scam_result.ok and scam_result.data else {}
-            obvious_phishing_reasons = list(scam_data.get("reasons") or [])
-            progress.emit("Checking links and URL reputation")
-            url_result = UrlReputationSkill().run(UrlReputationInput(email_text=body_text, subject=subject))
-            progress.emit("Scoring urgency and pressure signals")
-            urgency_result = UrgencyCheckSkill().run(UrgencyCheckInput(email_text=body_text, subject=subject))
-            progress.emit("Loading stored error patterns")
-            patterns_result = ListErrorPatternsSkill().run(ListErrorPatternsInput(limit=20))
+                content_data = content_result.data.model_dump() if content_result.ok and content_result.data else {}
+            if "email_header_auth_check" in routed_skills:
+                progress.emit("Checking sender and authentication headers")
+                header_result = EmailHeaderAuthCheckSkill().run(
+                    EmailHeaderAuthCheckInput(raw_email=raw_email, include_raw_headers=False)
+                )
+                header_data = header_result.data.model_dump() if header_result.ok and header_result.data else {}
+            if "scam_indicator_check" in routed_skills:
+                progress.emit("Checking obvious scam indicators")
+                scam_result = ScamIndicatorCheckSkill().run(
+                    ScamIndicatorCheckInput(
+                        raw_email=raw_email,
+                        subject=subject,
+                        from_address=from_address,
+                    )
+                )
+                scam_data = scam_result.data.model_dump() if scam_result.ok and scam_result.data else {}
+                obvious_phishing_reasons = list(scam_data.get("reasons") or [])
+            if "spam_campaign_check" in routed_skills:
+                progress.emit("Checking high-precision spam campaign patterns")
+                campaign_result = SpamCampaignCheckSkill().run(
+                    SpamCampaignCheckInput(
+                        raw_email=raw_email,
+                        email_text=body_text,
+                        subject=subject,
+                        from_address=from_address,
+                    )
+                )
+                campaign_data = campaign_result.data.model_dump() if campaign_result.ok and campaign_result.data else {}
+                campaign_reasons = list(campaign_data.get("reasons") or [])
+            if "url_reputation_check" in routed_skills:
+                progress.emit("Checking links and URL reputation")
+                url_result = UrlReputationSkill().run(UrlReputationInput(email_text=body_text, subject=subject))
+                url_data = url_result.data.model_dump() if url_result.ok and url_result.data else {}
+            if "urgency_check" in routed_skills:
+                progress.emit("Scoring urgency and pressure signals")
+                urgency_result = UrgencyCheckSkill().run(UrgencyCheckInput(email_text=body_text, subject=subject))
+                urgency_data = urgency_result.data.model_dump() if urgency_result.ok and urgency_result.data else {}
+            if "list_error_patterns" in routed_skills:
+                progress.emit("Loading stored error patterns")
+                patterns_result = ListErrorPatternsSkill().run(ListErrorPatternsInput(limit=20))
 
-            url_data = url_result.data.model_dump() if url_result.ok and url_result.data else {}
-            urgency_data = urgency_result.data.model_dump() if urgency_result.ok and urgency_result.data else {}
-
-        decision = (
-            "Phishing"
-            if obvious_phishing_reasons
-            else _required_decision_label(
-                rspamd_data,
-                None,
-                url_data if run_extra_tools else None,
-                urgency_data if run_extra_tools else None,
-                subject,
-                from_address,
-            )
+        decision = _required_decision_label(
+            rspamd_data,
+            content_data if run_extra_tools else None,
+            header_data if run_extra_tools else None,
+            url_data if run_extra_tools else None,
+            urgency_data if run_extra_tools else None,
+            scam_data if run_extra_tools else None,
+            campaign_data if run_extra_tools else None,
+            subject,
+            from_address,
         )
+        if campaign_reasons and decision == "Normal":
+            decision = "Spam"
 
         memory_data: dict[str, Any] = {}
         if run_extra_tools:
@@ -727,6 +1689,7 @@ def _direct_email_analysis(
                     from_address=from_address,
                     current_verdict=current_verdict,
                     rspamd_risk_level=str(rspamd_data.get("risk_level") or "") or None,
+                    header_risk_level=str(header_data.get("risk_level") or "") or None,
                     urgency_label=str(urgency_data.get("urgency_label") or "") or None,
                     url_risk_level=str(url_data.get("risk_level") or "") or None,
                 )
@@ -734,6 +1697,7 @@ def _direct_email_analysis(
             memory_data = memory_result.data.model_dump() if memory_result.ok and memory_result.data else {}
             if (
                 not obvious_phishing_reasons
+                and not campaign_reasons
                 and memory_data.get("matched")
                 and memory_data.get("suggested_verdict") == "benign"
             ):
@@ -741,11 +1705,17 @@ def _direct_email_analysis(
 
         if (
             not obvious_phishing_reasons
+            and not campaign_reasons
             and rspamd_score > 10
             and decision == "Normal"
-            and not _extra_checks_strongly_benign(url_data, urgency_data, memory_data)
+            and not _extra_checks_strongly_benign(header_data, url_data, urgency_data, memory_data)
         ):
             decision = "Spam"
+        if content_data:
+            if not bool(content_data.get("is_malicious")) and decision != "Phishing":
+                decision = "Normal"
+            elif bool(content_data.get("is_malicious")) and decision != "Phishing":
+                decision = "Spam"
 
         lines.extend([f"Verdict: {decision}", "Why this conclusion:"])
         if rspamd_result.ok:
@@ -756,6 +1726,15 @@ def _direct_email_analysis(
             )
         else:
             lines.append("- The main content scan could not be completed, so the verdict is based on the remaining available context.")
+
+        if header_result is not None:
+            if header_result.ok:
+                lines.append(
+                    "- The sender and authentication headers looked "
+                    + f"{header_data.get('risk_level', 'unknown')} risk."
+                )
+            else:
+                lines.append("- The sender and header-authentication check could not be completed.")
 
         if url_result is not None:
             if url_result.ok:
@@ -794,6 +1773,8 @@ def _direct_email_analysis(
 
         for reason in obvious_phishing_reasons:
             lines.append(f"- {reason}")
+        for reason in campaign_reasons:
+            lines.append(f"- {reason}")
 
         if decision == "Normal" and float(rspamd_data.get("score") or 0.0) >= 6:
             if rspamd_score > 10:
@@ -803,6 +1784,8 @@ def _direct_email_analysis(
         tools = ["rspamd_scan_email"]
         if scam_result is not None:
             tools.append("scam_indicator_check")
+        if campaign_result is not None:
+            tools.append("spam_campaign_check")
         if url_result is not None:
             tools.append("url_reputation_check")
         if urgency_result is not None:
@@ -1087,6 +2070,10 @@ class BallWidget(QWidget):
 
 
 class PetWindow(QMainWindow):
+    puter_auth_window_ready = Signal()
+    puter_auth_success_signal = Signal()
+    puter_auth_failure_signal = Signal(str)
+
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__()
         self.args = args
@@ -1096,6 +2083,19 @@ class PetWindow(QMainWindow):
         self.worker: AgentWorker | None = None
         self.mail_thread: QThread | None = None
         self.mail_worker: MailboxWorker | None = None
+        self.dev_threads: dict[int, QThread] = {}
+        self.dev_workers: dict[int, DeveloperExperimentWorker] = {}
+        self.dev_datasets: list[dict[str, Any]] = []
+        self.dev_last_configs: dict[int, dict[str, Any]] = {}
+        self.dev_last_completed: dict[int, int] = {idx: 0 for idx in range(DEVELOPER_SLOT_COUNT)}
+        self.dev_stop_requested_slots: set[int] = set()
+        self.dev_pending_restarts: dict[int, dict[str, Any]] = {}
+        self.dev_slot_widgets: list[dict[str, Any]] = []
+        self.dev_slot_metric_views: dict[int, QWidget] = {}
+        self.dev_slot_progress_views: dict[int, dict[str, Any]] = {}
+        self.dev_slot_metrics: dict[int, dict[str, Any]] = {}
+        self._pre_dev_geometry: QRect | None = None
+        self._pre_dev_flags = None
         self.puter_bridge: PuterBridgeController | None = None
         self.puter_history: list[dict[str, str]] = []
         self.puter_pending_messages: list[dict[str, str]] | None = None
@@ -1107,9 +2107,15 @@ class PetWindow(QMainWindow):
         self.puter_auth_view = None
         self.puter_auth_in_progress = False
         self.puter_retry_after_auth = False
+        self.developer_puter_requests: dict[int, dict[str, Any]] = {}
+        self.developer_puter_auth_retry_ids: set[int] = set()
+        self.developer_puter_retry_after_auth = False
         self.loaded_email_count = 0
         self.referenced_emails: list[dict[str, str]] = []
         self.expanded = False
+        self.puter_auth_window_ready.connect(self._on_puter_auth_window_ready, Qt.QueuedConnection)
+        self.puter_auth_success_signal.connect(self._puter_auth_succeeded, Qt.QueuedConnection)
+        self.puter_auth_failure_signal.connect(self._puter_auth_failed, Qt.QueuedConnection)
 
         self.setWindowTitle("Email Guardian")
         self.setWindowFlags(
@@ -1142,6 +2148,8 @@ class PetWindow(QMainWindow):
 
         self.panel = self._build_panel()
         self.stack.addWidget(self.panel)
+        self.dev_panel = self._build_developer_panel()
+        self.stack.addWidget(self.dev_panel)
         self.stack.setCurrentWidget(self.ball_page)
 
         self._apply_styles()
@@ -1150,6 +2158,71 @@ class PetWindow(QMainWindow):
         self.refresh_mailboxes()
         self._sync_provider_ui(self.args.provider)
         QTimer.singleShot(250, self.initialize_runtime)
+
+    def _build_window_controls(self) -> QWidget:
+        controls = QWidget()
+        controls.setObjectName("windowControls")
+        layout = QHBoxLayout(controls)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        minimize_button = QPushButton("Min")
+        maximize_button = QPushButton("Max")
+        close_button = QPushButton("Close")
+        for button in (minimize_button, maximize_button, close_button):
+            button.setObjectName("windowControlButton")
+            button.setCursor(QCursor(Qt.PointingHandCursor))
+            button.setFixedHeight(28)
+            button.setMinimumWidth(58)
+            button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            layout.addWidget(button)
+
+        close_button.setObjectName("windowCloseButton")
+        minimize_button.setToolTip("Minimize")
+        maximize_button.setToolTip("Maximize or restore")
+        close_button.setToolTip("Close Email Guardian and shut down launched services")
+        minimize_button.clicked.connect(self.minimize_window)
+        maximize_button.clicked.connect(self.toggle_window_maximized)
+        close_button.clicked.connect(self.close_all_now)
+        return controls
+
+    def _use_chat_panel_window_flags(self) -> None:
+        if not (self.windowFlags() & Qt.Tool):
+            return
+        geometry = self.geometry()
+        self.hide()
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Window)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setGeometry(geometry)
+        self.show()
+
+    def _use_ball_window_flags(self) -> None:
+        geometry = self.geometry()
+        self.hide()
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setGeometry(geometry)
+        self.show()
+
+    def minimize_window(self) -> None:
+        if self.stack.currentWidget() is self.panel:
+            self._use_chat_panel_window_flags()
+        self.showMinimized()
+
+    def toggle_window_maximized(self) -> None:
+        if self.isFullScreen() or self.isMaximized():
+            self.showNormal()
+            return
+        if self.stack.currentWidget() is self.panel:
+            self._use_chat_panel_window_flags()
+        self.showMaximized()
+
+    def close_all_now(self) -> None:
+        self._shutting_down = True
+        self._full_shutdown_cleanup()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def _build_panel(self) -> QWidget:
         panel = QFrame()
@@ -1259,6 +2332,9 @@ class PetWindow(QMainWindow):
         help_button = QPushButton("Help")
         help_button.setObjectName("secondaryButton")
         help_button.clicked.connect(self.show_help)
+        developer_button = QPushButton("Developer Mode")
+        developer_button.setObjectName("secondaryButton")
+        developer_button.clicked.connect(self.show_developer_mode)
         quit_all_button = QPushButton("Quit and shut down all")
         quit_all_button.setObjectName("dangerQuitButton")
         quit_all_button.setToolTip(
@@ -1276,6 +2352,7 @@ class PetWindow(QMainWindow):
             paste_headers_button,
             reset_button,
             help_button,
+            developer_button,
             quit_all_button,
         ):
             side_layout.addWidget(button)
@@ -1334,7 +2411,11 @@ class PetWindow(QMainWindow):
 
         chat_title = QLabel("Chat")
         chat_title.setObjectName("chatTitle")
-        main_layout.addWidget(chat_title)
+        chat_header = QHBoxLayout()
+        chat_header.addWidget(chat_title)
+        chat_header.addStretch()
+        chat_header.addWidget(self._build_window_controls())
+        main_layout.addLayout(chat_header)
 
         self.progress = QTextEdit()
         self.progress.setObjectName("progress")
@@ -1387,7 +2468,200 @@ class PetWindow(QMainWindow):
 
         for button in panel.findChildren(QPushButton):
             button.setCursor(QCursor(Qt.PointingHandCursor))
-            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            if button.objectName() not in {"windowControlButton", "windowCloseButton"}:
+                button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        return panel
+
+    def _build_developer_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("developerPanel")
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(14)
+
+        left = QFrame()
+        left.setObjectName("developerColumn")
+        left.setFixedWidth(470)
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(12, 12, 12, 12)
+        left_layout.setSpacing(10)
+        title = QLabel("Developer Mode")
+        title.setObjectName("developerTitle")
+        subtitle = QLabel("Dataset experiment configuration")
+        subtitle.setObjectName("status")
+        left_layout.addWidget(title)
+        left_layout.addWidget(subtitle)
+        refresh_dataset_button = QPushButton("Refresh Databases")
+        refresh_dataset_button.clicked.connect(self.refresh_developer_datasets)
+        left_layout.addWidget(refresh_dataset_button)
+        config_scroll = QScrollArea()
+        config_scroll.setWidgetResizable(True)
+        config_scroll.setObjectName("sideScroll")
+        config_host = QWidget()
+        config_layout = QVBoxLayout(config_host)
+        config_layout.setContentsMargins(0, 0, 0, 0)
+        config_layout.setSpacing(10)
+        self.dev_slot_widgets = []
+        for slot_idx in range(DEVELOPER_SLOT_COUNT):
+            slot_card = QFrame()
+            slot_card.setObjectName("developerSlotCard")
+            slot_layout = QVBoxLayout(slot_card)
+            slot_layout.setContentsMargins(10, 10, 10, 10)
+            slot_layout.setSpacing(8)
+            slot_title = QLabel(f"Test {slot_idx + 1}")
+            slot_title.setObjectName("sectionLabel")
+            dataset_combo = QComboBox()
+            dataset_combo.currentIndexChanged.connect(lambda index, s=slot_idx: self._developer_dataset_changed(s, index))
+            dataset_info = QLabel("No dataset loaded")
+            dataset_info.setObjectName("status")
+            dataset_info.setWordWrap(True)
+            source_list = QListWidget()
+            source_list.setObjectName("developerSourceList")
+            source_list.setFixedHeight(92)
+            limit_spin = QSpinBox()
+            limit_spin.setRange(1, 100000)
+            limit_spin.setValue(100)
+            limit_spin.setSingleStep(50)
+            sample_mode_combo = QComboBox()
+            sample_mode_combo.addItems([
+                "Sequential",
+                "Random",
+                "Balanced 50/50 ham/spam",
+                "Spam only",
+                "Ham only",
+            ])
+            sample_mode_combo.setCurrentText("Balanced 50/50 ham/spam")
+            model_combo = QComboBox()
+            model_combo.addItems(["gemini", "ollama", PUTER_PROVIDER])
+            model_combo.setCurrentText(self.args.provider)
+            model_input = QLineEdit(self.args.model)
+            model_input.setPlaceholderText("model name")
+            model_combo.currentTextChanged.connect(
+                lambda provider, field=model_input: field.setText(_desktop_model_default(provider))
+            )
+            slot_actions = QHBoxLayout()
+            start_button = QPushButton("Start")
+            start_button.clicked.connect(lambda _checked=False, s=slot_idx: self.start_developer_experiment(s))
+            new_experiment_button = QPushButton("New Experiment")
+            new_experiment_button.setObjectName("secondaryButton")
+            new_experiment_button.clicked.connect(lambda _checked=False, s=slot_idx: self.reset_developer_experiment_slot(s))
+            restart_button = QPushButton("Restart")
+            restart_button.setObjectName("secondaryButton")
+            restart_button.clicked.connect(lambda _checked=False, s=slot_idx: self.restart_developer_experiment(s))
+            stop_button = QPushButton("Stop")
+            stop_button.setObjectName("dangerQuitButton")
+            stop_button.clicked.connect(lambda _checked=False, s=slot_idx: self.stop_developer_experiment(s))
+            slot_actions.addWidget(start_button)
+            slot_actions.addWidget(new_experiment_button)
+            slot_actions.addWidget(restart_button)
+            slot_actions.addWidget(stop_button)
+
+            slot_layout.addWidget(slot_title)
+            slot_layout.addWidget(QLabel("Database"))
+            slot_layout.addWidget(dataset_combo)
+            slot_layout.addWidget(dataset_info)
+            slot_layout.addWidget(QLabel("Source filters"))
+            slot_layout.addWidget(source_list)
+            slot_layout.addWidget(QLabel("Emails to run"))
+            slot_layout.addWidget(limit_spin)
+            slot_layout.addWidget(QLabel("Sampling mode"))
+            slot_layout.addWidget(sample_mode_combo)
+            slot_layout.addWidget(QLabel("Configured model (not used by no-LLM rule engine)"))
+            slot_layout.addWidget(model_combo)
+            slot_layout.addWidget(model_input)
+            slot_layout.addLayout(slot_actions)
+            config_layout.addWidget(slot_card)
+            self.dev_slot_widgets.append(
+                {
+                    "dataset_combo": dataset_combo,
+                    "dataset_info": dataset_info,
+                    "source_list": source_list,
+                    "limit_spin": limit_spin,
+                    "sample_mode_combo": sample_mode_combo,
+                    "model_combo": model_combo,
+                    "model_input": model_input,
+                    "start_button": start_button,
+                    "new_experiment_button": new_experiment_button,
+                    "restart_button": restart_button,
+                    "stop_button": stop_button,
+                }
+            )
+        config_layout.addStretch()
+        config_scroll.setWidget(config_host)
+        left_layout.addWidget(config_scroll, stretch=1)
+
+        self.dev_back_button = QPushButton("Back To User Mode")
+        self.dev_back_button.setObjectName("secondaryButton")
+        self.dev_back_button.clicked.connect(self.leave_developer_mode)
+        left_layout.addStretch()
+        left_layout.addWidget(self.dev_back_button)
+        layout.addWidget(left)
+
+        center = QFrame()
+        center.setObjectName("developerColumn")
+        center_layout = QVBoxLayout(center)
+        center_layout.setContentsMargins(12, 12, 12, 12)
+        center_layout.setSpacing(10)
+        result_title = QLabel("Experiment Comparison")
+        result_title.setObjectName("developerTitle")
+        center_layout.addWidget(result_title)
+        summaries_grid = QGridLayout()
+        summaries_grid.setSpacing(10)
+        self.dev_slot_metric_views = {}
+        for slot_idx in range(DEVELOPER_SLOT_COUNT):
+            summary = DeveloperMetricCard(slot_idx)
+            summary.setObjectName("developerMetricCard")
+            self.dev_slot_metric_views[slot_idx] = summary
+            summaries_grid.addWidget(summary, slot_idx // 2, slot_idx % 2)
+        center_layout.addLayout(summaries_grid)
+        center_layout.addSpacing(18)
+        self.dev_chart = DeveloperMetricsChart()
+        self.dev_chart.setObjectName("developerChart")
+        center_layout.addWidget(self.dev_chart, stretch=1)
+        layout.addWidget(center, stretch=1)
+
+        right = QFrame()
+        right.setObjectName("developerColumn")
+        right.setFixedWidth(430)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(12, 12, 12, 12)
+        right_layout.setSpacing(10)
+        run_title = QLabel("Run Progress")
+        run_title.setObjectName("developerTitle")
+        run_header = QHBoxLayout()
+        run_header.addWidget(run_title)
+        run_header.addStretch()
+        run_header.addWidget(self._build_window_controls())
+        right_layout.addLayout(run_header)
+        self.dev_slot_progress_views = {}
+        for slot_idx in range(DEVELOPER_SLOT_COUNT):
+            box = QFrame()
+            box.setObjectName("developerProgressCard")
+            box_layout = QVBoxLayout(box)
+            box_layout.setContentsMargins(8, 8, 8, 8)
+            box_layout.setSpacing(6)
+            label = QLabel(f"Test {slot_idx + 1}: Idle")
+            label.setObjectName("sectionLabel")
+            progress_bar = QProgressBar()
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(0)
+            log_view = QTextEdit()
+            log_view.setObjectName("progress")
+            log_view.setReadOnly(True)
+            log_view.setPlaceholderText(f"Test {slot_idx + 1} logs")
+            log_view.setMinimumHeight(120)
+            box_layout.addWidget(label)
+            box_layout.addWidget(progress_bar)
+            box_layout.addWidget(log_view)
+            right_layout.addWidget(box)
+            self.dev_slot_progress_views[slot_idx] = {
+                "status_label": label,
+                "progress_bar": progress_bar,
+                "log_view": log_view,
+            }
+        right_layout.addStretch()
+        layout.addWidget(right)
 
         return panel
 
@@ -1404,6 +2678,46 @@ class PetWindow(QMainWindow):
             #panel {
                 background: #f8fafc;
                 border: 1px solid #d8dee9;
+                border-radius: 8px;
+            }
+            #developerPanel {
+                background: #0f172a;
+                border: 0;
+            }
+            #developerColumn {
+                background: #f8fafc;
+                border: 1px solid #334155;
+                border-radius: 12px;
+                padding: 8px;
+            }
+            #developerSlotCard, #developerProgressCard {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 10px;
+            }
+            #developerChart {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 12px;
+            }
+            #developerTitle {
+                font-size: 20px;
+                font-weight: 800;
+                color: #0f172a;
+            }
+            #metricCard {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-left: 8px solid #16697a;
+                border-radius: 10px;
+                padding: 10px;
+                font-size: 18px;
+                font-weight: 800;
+                color: #0f172a;
+            }
+            #developerSourceList {
+                background: #ffffff;
+                border: 1px solid #ccd4dd;
                 border-radius: 8px;
             }
             #title {
@@ -1491,13 +2805,29 @@ class PetWindow(QMainWindow):
                 color: #17202a;
             }
             QComboBox,
-            QLineEdit {
+            QLineEdit,
+            QSpinBox {
                 background: #ffffff;
                 border: 1px solid #ccd4dd;
                 border-radius: 8px;
                 padding: 7px 8px;
                 selection-background-color: #bfdbfe;
                 selection-color: #111827;
+            }
+            QSpinBox::up-button,
+            QSpinBox::down-button {
+                width: 20px;
+                border: 0;
+                background: #e2e8f0;
+            }
+            QSpinBox::up-button:hover,
+            QSpinBox::down-button:hover {
+                background: #cbd5e1;
+            }
+            #sampleSizeInput {
+                font-size: 16px;
+                font-weight: 800;
+                color: #0f172a;
             }
             QComboBox QAbstractItemView {
                 background: #ffffff;
@@ -1552,6 +2882,31 @@ class PetWindow(QMainWindow):
             QPushButton:disabled {
                 background: #9aa7b2;
             }
+            #windowControls {
+                background: transparent;
+            }
+            #windowControlButton {
+                background: #e9eef3;
+                color: #17202a;
+                border: 1px solid #cbd5e1;
+                border-radius: 7px;
+                padding: 4px 8px;
+                font-weight: 700;
+            }
+            #windowControlButton:hover {
+                background: #dbe3ea;
+            }
+            #windowCloseButton {
+                background: #b91c1c;
+                color: #ffffff;
+                border: 0;
+                border-radius: 7px;
+                padding: 4px 8px;
+                font-weight: 700;
+            }
+            #windowCloseButton:hover {
+                background: #991b1b;
+            }
             #secondaryButton {
                 background: #e9eef3;
                 color: #17202a;
@@ -1586,6 +2941,426 @@ class PetWindow(QMainWindow):
         self.header_ball.set_status(status)
         self.status_label.setText(text)
 
+    def show_developer_mode(self) -> None:
+        self._pre_dev_geometry = self.geometry()
+        self._pre_dev_flags = self.windowFlags()
+        self.hide()
+        self.setWindowFlags(Qt.Window)
+        self.stack.setCurrentWidget(self.dev_panel)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.showFullScreen()
+        for slot_idx in range(DEVELOPER_SLOT_COUNT):
+            if slot_idx in self.dev_slot_progress_views:
+                self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: Loading datasets")
+        QTimer.singleShot(120, self.refresh_developer_datasets)
+
+    def leave_developer_mode(self) -> None:
+        if self.dev_threads:
+            QMessageBox.information(self, "Experiment running", "Stop the running experiment before leaving developer mode.")
+            return
+        self.hide()
+        if self._pre_dev_flags is not None:
+            self.setWindowFlags(self._pre_dev_flags)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.showNormal()
+        self.stack.setCurrentWidget(self.panel)
+        if self._pre_dev_geometry is not None:
+            self.setGeometry(self._pre_dev_geometry)
+        else:
+            self.resize(PANEL_SIZE)
+        self.show()
+
+    def refresh_developer_datasets(self) -> None:
+        if not self.dev_slot_widgets:
+            return
+        current_names = {
+            slot_idx: widgets["dataset_combo"].currentText()
+            for slot_idx, widgets in enumerate(self.dev_slot_widgets)
+        }
+        current_paths = {
+            slot_idx: self._developer_selected_dataset_path(slot_idx)
+            for slot_idx in range(len(self.dev_slot_widgets))
+        }
+        self.dev_datasets = []
+        for path in _developer_dataset_paths():
+            try:
+                summary = _developer_dataset_summary(path)
+            except Exception as exc:
+                for slot_idx in range(DEVELOPER_SLOT_COUNT):
+                    self._developer_append_log(slot_idx, f"Could not read {path}: {exc}")
+                continue
+            if "binary_label" not in summary.get("fields", []):
+                continue
+            self.dev_datasets.append(summary)
+            if Path(summary.get("path", "")).name == "spam_binary_dataset.csv":
+                self.dev_datasets.append(
+                    _developer_preset_dataset(
+                        summary,
+                        name="spam_binary_dataset.csv [github only]",
+                        preset_sources=["github"],
+                    )
+                )
+                self.dev_datasets.append(
+                    _developer_preset_dataset(
+                        summary,
+                        name="spam_binary_dataset.csv [meajor only]",
+                        preset_sources=["meajor"],
+                    )
+                )
+        for slot_idx, widgets in enumerate(self.dev_slot_widgets):
+            combo = widgets["dataset_combo"]
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("-- Select dataset --", None)
+            for item in self.dev_datasets:
+                combo.addItem(item["name"], item)
+            combo.blockSignals(False)
+            restored = False
+            current_name = current_names.get(slot_idx) or ""
+            if current_name:
+                idx = combo.findText(current_name)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                    restored = True
+            current_path = current_paths.get(slot_idx) or ""
+            if not restored and current_path:
+                for idx in range(combo.count()):
+                    item = combo.itemData(idx)
+                    if isinstance(item, dict) and item.get("path") == current_path:
+                        combo.setCurrentIndex(idx)
+                        restored = True
+                        break
+            if not restored:
+                combo.setCurrentIndex(0)
+            self._developer_dataset_changed(slot_idx, combo.currentIndex())
+        for slot_idx in range(DEVELOPER_SLOT_COUNT):
+            if slot_idx in self.dev_slot_progress_views:
+                self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: Ready")
+
+    def _developer_selected_dataset_path(self, slot_idx: int) -> str:
+        if not self.dev_slot_widgets:
+            return ""
+        data = self.dev_slot_widgets[slot_idx]["dataset_combo"].currentData()
+        if isinstance(data, dict):
+            return str(data.get("path") or "")
+        return str(data or "")
+
+    def _developer_dataset_changed(self, slot_idx: int, index: int) -> None:
+        if index < 0:
+            return
+        widgets = self.dev_slot_widgets[slot_idx]
+        combo_item = widgets["dataset_combo"].itemData(index)
+        if not isinstance(combo_item, dict):
+            widgets["dataset_info"].setText("No dataset selected")
+            widgets["source_list"].clear()
+            return
+        item = combo_item
+        sources = item.get("sources") or []
+        labels = item.get("labels") or []
+        preset_sources = item.get("preset_sources") or []
+        visible_sources = preset_sources or sources
+        row_text = f"{item.get('row_count', 0)}+" if item.get("row_count_is_sampled") else str(item.get("row_count", 0))
+        widgets["dataset_info"].setText(
+            f"Rows scanned: {row_text}\nSources: {', '.join(visible_sources[:8]) or 'n/a'}\nLabels: {', '.join(labels[:8]) or 'n/a'}"
+        )
+        widgets["source_list"].clear()
+        if not visible_sources:
+            list_item = QListWidgetItem("all")
+            list_item.setFlags(list_item.flags() | Qt.ItemIsUserCheckable)
+            list_item.setCheckState(Qt.Checked)
+            widgets["source_list"].addItem(list_item)
+            return
+        for source in visible_sources:
+            list_item = QListWidgetItem(source)
+            list_item.setFlags(list_item.flags() | Qt.ItemIsUserCheckable)
+            list_item.setCheckState(Qt.Checked)
+            widgets["source_list"].addItem(list_item)
+
+    def _developer_selected_sources(self, slot_idx: int) -> list[str]:
+        data = self.dev_slot_widgets[slot_idx]["dataset_combo"].currentData() if self.dev_slot_widgets else None
+        if isinstance(data, dict):
+            preset_sources = data.get("preset_sources") or []
+            if preset_sources:
+                return list(preset_sources)
+        sources: list[str] = []
+        source_list = self.dev_slot_widgets[slot_idx]["source_list"]
+        for idx in range(source_list.count()):
+            item = source_list.item(idx)
+            if item.checkState() == Qt.Checked and item.text() != "all":
+                sources.append(item.text())
+        return sources
+
+    def _developer_build_config(self, slot_idx: int, *, resume: bool = False) -> dict[str, Any]:
+        dataset_path = self._developer_selected_dataset_path(slot_idx)
+        if not dataset_path:
+            return {}
+        widgets = self.dev_slot_widgets[slot_idx]
+        provider = widgets["model_combo"].currentText().strip()
+        model = widgets["model_input"].text().strip() or _desktop_model_default(provider)
+        if resume and slot_idx in self.dev_last_configs:
+            config = dict(self.dev_last_configs[slot_idx])
+            config["offset"] = int(self.dev_last_completed.get(slot_idx, 0))
+            config["limit"] = int(widgets["limit_spin"].value())
+            config["sample_mode"] = widgets["sample_mode_combo"].currentText()
+            return config
+        run_id = time.strftime("%Y%m%d-%H%M%S")
+        return {
+            "dataset_path": dataset_path,
+            "sources": self._developer_selected_sources(slot_idx),
+            "limit": int(widgets["limit_spin"].value()),
+            "offset": 0,
+            "sample_mode": widgets["sample_mode_combo"].currentText(),
+            "seed": 42,
+            "provider": provider,
+            "model": model,
+            "engine": "content_model_ifelse_no_llm_v1",
+            "rspamd_base_url": self.args.base_url,
+            "ollama_base_url": self.args.ollama_base_url,
+            "llm_final_review": False,
+            "run_dir": str(DEVELOPER_RUNS_DIR / f"{run_id}-test{slot_idx + 1}"),
+            "runner": "content_model_ifelse_no_llm_v1",
+        }
+
+    def start_developer_experiments(self) -> None:
+        started = False
+        for slot_idx in range(DEVELOPER_SLOT_COUNT):
+            if slot_idx in self.dev_threads:
+                continue
+            if self._start_developer_experiment(slot_idx, resume=False, show_errors=False):
+                started = True
+        if not started:
+            QMessageBox.information(self, "No tests selected", "Choose a dataset in at least one test slot.")
+
+    def resume_developer_experiments(self) -> None:
+        started = False
+        for slot_idx in range(DEVELOPER_SLOT_COUNT):
+            if slot_idx in self.dev_threads:
+                continue
+            if self._start_developer_experiment(slot_idx, resume=True, show_errors=False):
+                started = True
+        if not started:
+            QMessageBox.information(self, "No previous run", "There is no selected test slot with resumable history yet.")
+
+    def start_developer_experiment(self, slot_idx: int) -> None:
+        self._start_developer_experiment(slot_idx, resume=False, show_errors=True)
+
+    def reset_developer_experiment_slot(self, slot_idx: int) -> None:
+        if slot_idx in self.dev_threads:
+            QMessageBox.information(self, "Experiment running", f"Stop Test {slot_idx + 1} before starting a new experiment.")
+            return
+        if slot_idx not in self.dev_slot_progress_views or slot_idx >= len(self.dev_slot_widgets):
+            return
+
+        self.dev_last_configs.pop(slot_idx, None)
+        self.dev_last_completed[slot_idx] = 0
+        self.dev_stop_requested_slots.discard(slot_idx)
+        self.dev_pending_restarts.pop(slot_idx, None)
+        self.dev_slot_metrics.pop(slot_idx, None)
+
+        widgets = self.dev_slot_widgets[slot_idx]
+        dataset_combo = widgets["dataset_combo"]
+        dataset_combo.setCurrentIndex(0 if dataset_combo.count() else -1)
+        widgets["source_list"].clear()
+        widgets["dataset_info"].setText("No dataset selected")
+        widgets["limit_spin"].setValue(100)
+        widgets["sample_mode_combo"].setCurrentText("Balanced 50/50 ham/spam")
+        widgets["model_combo"].setCurrentText(self.args.provider)
+        widgets["model_input"].setText(_desktop_model_default(self.args.provider))
+
+        progress_widgets = self.dev_slot_progress_views[slot_idx]
+        progress_widgets["progress_bar"].setValue(0)
+        progress_widgets["status_label"].setText(f"Test {slot_idx + 1}: New experiment")
+        progress_widgets["log_view"].clear()
+        self.dev_slot_metric_views[slot_idx].clear()
+        self.dev_chart.set_slot_metrics(self.dev_slot_metrics)
+
+    def restart_developer_experiment(self, slot_idx: int) -> None:
+        config = self._developer_build_config(slot_idx, resume=False)
+        if not config:
+            QMessageBox.information(self, "No dataset selected", f"Choose a dataset for Test {slot_idx + 1} first.")
+            return
+        self.dev_last_completed[slot_idx] = 0
+        self.dev_last_configs[slot_idx] = dict(config)
+        self.dev_pending_restarts.pop(slot_idx, None)
+        if slot_idx in self.dev_threads:
+            self.dev_pending_restarts[slot_idx] = dict(config)
+            self.stop_developer_experiment(slot_idx, restart=True)
+            return
+        self._start_developer_worker(slot_idx, config)
+
+    def _start_developer_experiment(self, slot_idx: int, *, resume: bool, show_errors: bool) -> bool:
+        if slot_idx in self.dev_threads:
+            if show_errors:
+                QMessageBox.information(self, "Busy", f"Test {slot_idx + 1} is already running.")
+            return False
+        if resume and slot_idx not in self.dev_last_configs:
+            if show_errors:
+                QMessageBox.information(self, "No previous run", f"Test {slot_idx + 1} has no resumable history yet.")
+            return False
+        config = self._developer_build_config(slot_idx, resume=resume)
+        if not config:
+            if show_errors:
+                QMessageBox.information(self, "No dataset selected", f"Choose a dataset for Test {slot_idx + 1} first.")
+            progress_widgets = self.dev_slot_progress_views[slot_idx]
+            progress_widgets["progress_bar"].setValue(0)
+            progress_widgets["status_label"].setText(f"Test {slot_idx + 1}: Idle")
+            return False
+        if not resume:
+            self.dev_last_completed[slot_idx] = 0
+        self.dev_last_configs[slot_idx] = dict(config)
+        self._start_developer_worker(slot_idx, config)
+        return True
+
+    def _start_developer_worker(self, slot_idx: int, config: dict[str, Any]) -> None:
+        if slot_idx in self.dev_threads:
+            return
+        self.dev_stop_requested_slots.discard(slot_idx)
+        self.dev_pending_restarts.pop(slot_idx, None)
+        self.dev_last_configs[slot_idx] = dict(config)
+        progress_widgets = self.dev_slot_progress_views[slot_idx]
+        progress_widgets["log_view"].clear()
+        progress_widgets["progress_bar"].setValue(0)
+        progress_widgets["status_label"].setText(f"Test {slot_idx + 1}: Running")
+        self._developer_append_log(slot_idx, f"Starting run: {config['run_dir']}")
+        self._developer_append_log(
+            slot_idx,
+            f"Engine: {config['runner']} (configured model: {config['provider']} / {config['model']}; LLM disabled)",
+        )
+        thread = QThread()
+        worker = DeveloperExperimentWorker(config)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._developer_progress_from_sender, Qt.QueuedConnection)
+        worker.log.connect(self._developer_log_from_sender, Qt.QueuedConnection)
+        worker.puter_review_requested.connect(self._handle_developer_puter_review, Qt.QueuedConnection)
+        worker.metrics_ready.connect(self._developer_metrics_from_sender, Qt.QueuedConnection)
+        worker.finished.connect(self._developer_finished_from_sender, Qt.QueuedConnection)
+        worker.failed.connect(self._developer_failed_from_sender, Qt.QueuedConnection)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._developer_thread_finished_from_sender, Qt.QueuedConnection)
+        self.dev_threads[slot_idx] = thread
+        self.dev_workers[slot_idx] = worker
+        thread.start()
+
+    def stop_developer_experiments(self) -> None:
+        if not self.dev_workers:
+            return
+        for slot_idx, worker in list(self.dev_workers.items()):
+            self.stop_developer_experiment(slot_idx)
+
+    def stop_developer_experiment(self, slot_idx: int, *, restart: bool = False) -> None:
+        worker = self.dev_workers.get(slot_idx)
+        if worker is None:
+            if not restart and slot_idx in self.dev_slot_progress_views:
+                self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: Idle")
+            return
+        self.dev_stop_requested_slots.add(slot_idx)
+        worker.request_stop()
+        action = "Restarting" if restart else "Stopping"
+        self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: {action}")
+        if restart:
+            self._developer_append_log(slot_idx, "Restart requested. This test will restart after the current email.")
+        else:
+            self._developer_append_log(slot_idx, "Stop requested. This test will stop after the current email.")
+
+    def _developer_progress(self, slot_idx: int, current: int, total: int) -> None:
+        last_config = self.dev_last_configs.get(slot_idx, {})
+        self.dev_last_completed[slot_idx] = int(last_config.get("offset", 0)) + current
+        value = int((current / total) * 100) if total else 0
+        self.dev_slot_progress_views[slot_idx]["progress_bar"].setValue(value)
+        self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: Running {current}/{total}")
+
+    def _developer_update_metrics(self, slot_idx: int, metrics: object) -> None:
+        if not isinstance(metrics, dict):
+            return
+        self.dev_slot_metrics[slot_idx] = dict(metrics)
+        metric_view = self.dev_slot_metric_views.get(slot_idx)
+        if isinstance(metric_view, DeveloperMetricCard):
+            metric_view.set_metrics(metrics)
+        self.dev_chart.set_slot_metrics(self.dev_slot_metrics)
+
+    def _developer_finished(self, slot_idx: int, run_dir: str) -> None:
+        if slot_idx in self.dev_stop_requested_slots:
+            self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: Stopped")
+            self._developer_append_log(slot_idx, f"Stopped. Partial results saved in {run_dir}")
+            return
+        self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: Finished")
+        self._developer_append_log(slot_idx, f"Finished. Saved results in {run_dir}")
+
+    def _developer_failed(self, slot_idx: int, message: str) -> None:
+        self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: Failed")
+        self._developer_append_log(slot_idx, f"ERROR: {message}")
+
+    def _developer_thread_finished(self, slot_idx: int) -> None:
+        thread = self.dev_threads.pop(slot_idx, None)
+        if thread is not None:
+            thread.deleteLater()
+        self.dev_workers.pop(slot_idx, None)
+        self.dev_stop_requested_slots.discard(slot_idx)
+        restart_config = self.dev_pending_restarts.pop(slot_idx, None)
+        if restart_config is not None:
+            self._start_developer_worker(slot_idx, restart_config)
+
+    def _developer_append_log(self, slot_idx: int, text: str) -> None:
+        if slot_idx not in self.dev_slot_progress_views:
+            return
+        log_view = self.dev_slot_progress_views[slot_idx]["log_view"]
+        log_view.append(text)
+        log_view.verticalScrollBar().setValue(log_view.verticalScrollBar().maximum())
+
+    def _developer_slot_for_worker(self, worker: QObject | None) -> int | None:
+        if worker is None:
+            return None
+        for slot_idx, known_worker in self.dev_workers.items():
+            if known_worker is worker:
+                return slot_idx
+        return None
+
+    def _developer_slot_for_thread(self, thread: QObject | None) -> int | None:
+        if thread is None:
+            return None
+        for slot_idx, known_thread in self.dev_threads.items():
+            if known_thread is thread:
+                return slot_idx
+        return None
+
+    def _developer_progress_from_sender(self, current: int, total: int) -> None:
+        slot_idx = self._developer_slot_for_worker(self.sender())
+        if slot_idx is None:
+            return
+        self._developer_progress(slot_idx, current, total)
+
+    def _developer_log_from_sender(self, text: str) -> None:
+        slot_idx = self._developer_slot_for_worker(self.sender())
+        if slot_idx is None:
+            return
+        self._developer_append_log(slot_idx, text)
+
+    def _developer_metrics_from_sender(self, metrics: object) -> None:
+        slot_idx = self._developer_slot_for_worker(self.sender())
+        if slot_idx is None:
+            return
+        self._developer_update_metrics(slot_idx, metrics)
+
+    def _developer_finished_from_sender(self, run_dir: str) -> None:
+        slot_idx = self._developer_slot_for_worker(self.sender())
+        if slot_idx is None:
+            return
+        self._developer_finished(slot_idx, run_dir)
+
+    def _developer_failed_from_sender(self, message: str) -> None:
+        slot_idx = self._developer_slot_for_worker(self.sender())
+        if slot_idx is None:
+            return
+        self._developer_failed(slot_idx, message)
+
+    def _developer_thread_finished_from_sender(self) -> None:
+        slot_idx = self._developer_slot_for_thread(self.sender())
+        if slot_idx is None:
+            return
+        self._developer_thread_finished(slot_idx)
+
     def initialize_runtime(self) -> None:
         if self.args.provider == PUTER_PROVIDER:
             self.progress.clear()
@@ -1611,7 +3386,7 @@ class PetWindow(QMainWindow):
             self.input.setPlaceholderText("Ask anything, or paste a raw email/header here.")
 
     def _puter_bridge_url(self) -> str:
-        return f"http://127.0.0.1:{PUTER_WEB_PORT}/static/puter_bridge.html"
+        return f"http://127.0.0.1:{PUTER_WEB_PORT}/static/puter_bridge.html?v=developer-retry-v2"
 
     def _puter_auth_url(self) -> str:
         return f"http://127.0.0.1:{PUTER_WEB_PORT}/static/puter_auth.html"
@@ -1656,8 +3431,11 @@ class PetWindow(QMainWindow):
             bridge.ready.connect(self._puter_bridge_ready)
             bridge.chunk.connect(self._puter_bridge_chunk)
             bridge.completed.connect(self._puter_bridge_completed)
+            bridge.completed.connect(self._developer_puter_bridge_completed)
             bridge.auth_required.connect(self._puter_bridge_auth_required)
+            bridge.auth_required.connect(self._developer_puter_bridge_auth_required)
             bridge.failed.connect(self._puter_bridge_failed)
+            bridge.failed.connect(self._developer_puter_bridge_failed)
             bridge.ensure_loaded()
             self.puter_bridge = bridge
         return self.puter_bridge
@@ -1669,6 +3447,18 @@ class PetWindow(QMainWindow):
             self.puter_retry_after_auth = False
             self.append_progress("Puter session refreshed. Retrying request.")
             self.puter_bridge.submit(self.puter_pending_messages, self.args.model, self.puter_active_request_id)
+            return
+        if self.developer_puter_retry_after_auth and self.puter_bridge is not None:
+            self.developer_puter_retry_after_auth = False
+            retry_ids = list(self.developer_puter_auth_retry_ids)
+            self.developer_puter_auth_retry_ids.clear()
+            for request_id in retry_ids:
+                payload = self.developer_puter_requests.get(request_id)
+                if payload is None:
+                    continue
+                model = str(payload.get("model") or _desktop_model_default(PUTER_PROVIDER))
+                prompt = str(payload.get("prompt") or "")
+                self.puter_bridge.submit([{"role": "user", "content": prompt}], model, request_id)
             return
         if self.puter_active_request_id is None:
             self.set_progress_state("success")
@@ -1737,11 +3527,11 @@ class PetWindow(QMainWindow):
                 auth_type = str(payload.get("type", ""))
                 auth_message = str(payload.get("message", ""))
                 if auth_type == "ready":
-                    controller.append_progress("Puter sign-in window is ready")
+                    controller.puter_auth_window_ready.emit()
                 elif auth_type == "success":
-                    controller._puter_auth_succeeded()
+                    controller.puter_auth_success_signal.emit()
                 elif auth_type == "error":
-                    controller._puter_auth_failed(auth_message or "Puter sign-in failed")
+                    controller.puter_auth_failure_signal.emit(auth_message or "Puter sign-in failed")
 
         page = _AuthPage(self.puter_profile, view)
         page.settings().setAttribute(
@@ -1768,11 +3558,18 @@ class PetWindow(QMainWindow):
         self.puter_auth_window.raise_()
         self.puter_auth_window.activateWindow()
 
+    def _on_puter_auth_window_ready(self) -> None:
+        self.append_progress("Puter sign-in window is ready")
+
     def _puter_auth_succeeded(self) -> None:
         self.puter_auth_in_progress = False
         if self.puter_auth_window is not None:
             self.puter_auth_window.hide()
         self.append_progress("Puter sign-in completed. Refreshing session before retry.")
+        if self.developer_puter_auth_retry_ids and self.puter_bridge is not None:
+            self.developer_puter_retry_after_auth = True
+            self.puter_bridge.reload()
+            return
         if self.puter_bridge is None or self.puter_pending_messages is None or self.puter_active_request_id is None:
             self.set_progress_state("success")
             self.set_status("ready", f"Ready: {self.args.provider} / {self.args.model}")
@@ -1812,6 +3609,133 @@ class PetWindow(QMainWindow):
             return
         self._finish_puter_request()
         self._show_failure(message)
+
+    def _complete_developer_puter_request(self, request_id: int, result: dict[str, Any]) -> None:
+        payload = self.developer_puter_requests.pop(request_id, None)
+        if payload is None:
+            return
+        self.developer_puter_auth_retry_ids.discard(request_id)
+        payload["result"] = result
+        event = payload.get("event")
+        if isinstance(event, threading.Event):
+            event.set()
+
+    def _submit_developer_puter_payload(self, payload: dict[str, Any]) -> None:
+        bridge = self._ensure_puter_bridge()
+        request_id = self.puter_next_request_id
+        self.puter_next_request_id += 1
+        self.developer_puter_requests[request_id] = payload
+        payload["request_id"] = request_id
+        model = str(payload.get("model") or _desktop_model_default(PUTER_PROVIDER))
+        prompt = str(payload.get("prompt") or "")
+        bridge.submit([{"role": "user", "content": prompt}], model, request_id)
+
+    def _retry_developer_puter_request(self, payload: dict[str, Any], message: str) -> bool:
+        attempt = int(payload.get("attempt") or 1)
+        max_attempts = int(payload.get("max_attempts") or 1)
+        if attempt >= max_attempts:
+            return False
+        payload["attempt"] = attempt + 1
+        delay_ms = min(15000, 1000 * (2 ** (attempt - 1)))
+        payload["last_error"] = message
+        QTimer.singleShot(delay_ms, lambda p=payload: self._resubmit_developer_puter_payload(p))
+        return True
+
+    def _resubmit_developer_puter_payload(self, payload: dict[str, Any]) -> None:
+        if payload.get("result") is not None:
+            return
+        try:
+            self._submit_developer_puter_payload(payload)
+        except Exception as exc:
+            payload["result"] = {
+                "ok": False,
+                "verdict": None,
+                "reason": str(exc),
+                "raw_text": "",
+            }
+            event = payload.get("event")
+            if isinstance(event, threading.Event):
+                event.set()
+
+    def _handle_developer_puter_review(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        try:
+            self._submit_developer_puter_payload(payload)
+        except Exception as exc:
+            payload["result"] = {
+                "ok": False,
+                "verdict": None,
+                "reason": str(exc),
+                "raw_text": "",
+            }
+            event = payload.get("event")
+            if isinstance(event, threading.Event):
+                event.set()
+
+    def _developer_puter_bridge_completed(self, request_id: int, text: str) -> None:
+        if request_id not in self.developer_puter_requests:
+            return
+        verdict, rationale = _developer_parse_llm_verdict(text)
+        self._complete_developer_puter_request(
+            request_id,
+            {
+                "ok": verdict in {"Normal", "Spam", "Phishing"},
+                "verdict": verdict,
+                "reason": rationale,
+                "raw_text": text,
+            },
+        )
+
+    def _developer_puter_bridge_failed(self, request_id: int, message: str) -> None:
+        if request_id == 0:
+            for pending_id in list(self.developer_puter_requests):
+                self._complete_developer_puter_request(
+                    pending_id,
+                    {"ok": False, "verdict": None, "reason": message, "raw_text": ""},
+            )
+            return
+        payload = self.developer_puter_requests.pop(request_id, None)
+        if payload is None:
+            return
+        self.developer_puter_auth_retry_ids.discard(request_id)
+        if self._retry_developer_puter_request(payload, message):
+            return
+        attempt = int(payload.get("attempt") or 1)
+        max_attempts = int(payload.get("max_attempts") or 1)
+        reason = f"{message} (attempt {attempt}/{max_attempts})"
+        if payload.get("last_error") and str(payload.get("last_error")) != message:
+            reason = f"{reason}; previous error: {payload.get('last_error')}"
+        payload["result"] = {
+            "ok": False,
+            "verdict": None,
+            "reason": reason,
+            "raw_text": "",
+        }
+        event = payload.get("event")
+        if isinstance(event, threading.Event):
+            event.set()
+
+    def _developer_puter_bridge_auth_required(self, request_id: int, message: str) -> None:
+        if request_id not in self.developer_puter_requests:
+            return
+        self.developer_puter_auth_retry_ids.add(request_id)
+        try:
+            self._ensure_puter_auth_window()
+            self.puter_auth_window.show()
+            self.puter_auth_window.raise_()
+            self.puter_auth_window.activateWindow()
+        except Exception:
+            self.developer_puter_auth_retry_ids.discard(request_id)
+            self._complete_developer_puter_request(
+                request_id,
+                {
+                    "ok": False,
+                    "verdict": None,
+                    "reason": message or "Puter sign-in required before developer final review can run.",
+                    "raw_text": "",
+                },
+            )
 
     def _run_puter_agent(
         self,
@@ -1876,9 +3800,15 @@ class PetWindow(QMainWindow):
         if not self.expanded:
             return
         self.expanded = False
+        if self.isMaximized():
+            self.showNormal()
         old_geo = self.geometry()
         target = QRect(old_geo.x(), old_geo.y(), BALL_SIZE, BALL_SIZE)
-        self._animate_geometry(target, after=lambda: self.stack.setCurrentWidget(self.ball_page))
+        def after_collapse() -> None:
+            self.stack.setCurrentWidget(self.ball_page)
+            self._use_ball_window_flags()
+
+        self._animate_geometry(target, after=after_collapse)
 
     def _animate_geometry(self, target: QRect, after=None) -> None:
         animation = QPropertyAnimation(self, b"geometry", self)
@@ -2461,6 +4391,11 @@ class PetWindow(QMainWindow):
         if self.mail_thread is not None:
             self.mail_thread.quit()
             self.mail_thread.wait(timeout_ms)
+        for worker in list(self.dev_workers.values()):
+            worker.request_stop()
+        for thread in list(self.dev_threads.values()):
+            thread.quit()
+            thread.wait(timeout_ms)
 
     def _full_shutdown_cleanup(self) -> None:
         if self.puter_server_process is not None and self.puter_server_process.poll() is None:
