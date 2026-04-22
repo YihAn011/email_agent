@@ -9,9 +9,25 @@
     body { background: #0f172a; color: #94a3b8; font-family: 'Menlo', 'Monaco', 'Consolas', monospace; font-size: 15px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
 
     /* Top bar */
-    #topbar { background: #1e293b; border-bottom: 1px solid #0f172a; padding: 10px 18px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+    #topbar { background: #1e293b; border-bottom: 1px solid #0f172a; padding: 10px 18px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-shrink: 0; }
     #topbar .brand { color: #7c3aed; font-weight: 700; font-size: 15px; letter-spacing: 1px; }
     #topbar .account { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #64748b; }
+    #topbar-right { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; justify-content: flex-end; }
+    #model-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    #model-controls label { color: #64748b; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; }
+    #model-provider,
+    #model-name {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 4px;
+      color: #e2e8f0;
+      font-family: inherit;
+      font-size: 12px;
+      padding: 6px 8px;
+    }
+    #model-provider { min-width: 136px; }
+    #model-name { min-width: 144px; }
+    #provider-hint { color: #475569; font-size: 11px; }
     #status-dot { width: 7px; height: 7px; border-radius: 50%; background: #475569; display: inline-block; }
     #status-dot.connected { background: #22c55e; }
 
@@ -119,6 +135,13 @@
 
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
     @keyframes blink  { 50%{opacity:0} }
+
+    @media (max-width: 980px) {
+      #topbar { align-items: flex-start; }
+      #topbar-right { width: 100%; justify-content: flex-start; }
+      #split { flex-direction: column; }
+      #inbox { width: 100%; min-height: 240px; border-right: 0; border-bottom: 1px solid #1e293b; }
+    }
   </style>
 </head>
 <body>
@@ -128,10 +151,21 @@
       <span class="brand">✦ INTELLIGENT MAIL</span>
       <span id="mailbox-address" style="font-size:12px;color:#475569;letter-spacing:0;font-weight:400;"></span>
     </div>
-    <span class="account">
-      <span id="status-dot"></span>
-      <span id="account-label">not connected</span>
-    </span>
+    <div id="topbar-right">
+      <div id="model-controls">
+        <label for="model-provider">Analyzer</label>
+        <select id="model-provider">
+          <option value="server-agent">Server Agent</option>
+          <option value="puter-openai">Puter OpenAI</option>
+        </select>
+        <input id="model-name" type="text" value="gpt-5.4" />
+      </div>
+      <div id="provider-hint">Server Agent uses Gemini/Ollama. Puter OpenAI runs in-browser.</div>
+      <span class="account">
+        <span id="status-dot"></span>
+        <span id="account-label">not connected</span>
+      </span>
+    </div>
   </div>
 
   <div id="split">
@@ -180,7 +214,7 @@
     </div>
 
   </div>
-
+  <script src="https://js.puter.com/v2/"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

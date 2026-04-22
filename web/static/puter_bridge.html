@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Puter Bridge</title>
+</head>
+<body>
+  <script src="https://js.puter.com/v2/"></script>
+  <script>
+    const EVENT_PREFIX = "__PUTER_EVENT__";
+
+    function emitEvent(payload) {
+      console.log(EVENT_PREFIX + JSON.stringify(payload));
+    }
+
+    async function waitForPuter() {
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < 15000) {
+        if (window.puter && window.puter.ai && typeof window.puter.ai.chat === "function") {
+          emitEvent({ type: "ready" });
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      emitEvent({ type: "error", request_id: 0, message: "Timed out waiting for puter.js to load." });
+    }
+
+    async function ensurePuterAuth(requestId) {
+      if (!window.puter || !window.puter.auth) {
+        return true;
+      }
+
+      try {
+        const signedIn = typeof window.puter.auth.isSignedIn === "function"
+          ? !!window.puter.auth.isSignedIn()
+          : true;
+        if (signedIn) {
+          return true;
+        }
+
+        emitEvent({
+          type: "chunk",
+          request_id: requestId,
+          text: "",
+          full_text: "Authenticating with Puter...",
+        });
+
+        if (typeof window.puter.auth.signIn === "function") {
+          await window.puter.auth.signIn({ attempt_temp_user_creation: true });
+        }
+
+        const signedInAfter = typeof window.puter.auth.isSignedIn === "function"
+          ? !!window.puter.auth.isSignedIn()
+          : true;
+        if (!signedInAfter) {
+          throw new Error("Puter authentication did not complete.");
+        }
+      } catch (error) {
+        emitEvent({
+          type: "auth_required",
+          request_id: requestId,
+          message: "Puter requires a one-time sign-in. Complete the sign-in window and the message will retry automatically.",
+        });
+        return false;
+      }
+      return true;
+    }
+
+    window.__puterBridgeSubmit = async function submitToPuter(payload) {
+      try {
+        if (!window.puter || !window.puter.ai || typeof window.puter.ai.chat !== "function") {
+          throw new Error("Puter SDK is not ready.");
+        }
+
+        const authReady = await ensurePuterAuth(payload.request_id);
+        if (!authReady) {
+          return;
+        }
+
+        let watchdog = null;
+        let timedOut = false;
+        const resetWatchdog = () => {
+          if (watchdog) {
+            clearTimeout(watchdog);
+          }
+          watchdog = setTimeout(() => {
+            timedOut = true;
+          }, 30000);
+        };
+
+        resetWatchdog();
+        const response = await window.puter.ai.chat(payload.messages, {
+          model: payload.model,
+          stream: true,
+          temperature: 0,
+        });
+
+        let fullText = "";
+        for await (const part of response) {
+          if (timedOut) {
+            throw new Error("Timed out waiting for Puter model output.");
+          }
+          resetWatchdog();
+          const text = part && typeof part.text === "string" ? part.text : "";
+          if (!text) continue;
+          fullText += text;
+          emitEvent({
+            type: "chunk",
+            request_id: payload.request_id,
+            text,
+            full_text: fullText,
+          });
+        }
+
+        if (watchdog) {
+          clearTimeout(watchdog);
+        }
+        if (timedOut) {
+          throw new Error("Timed out waiting for Puter model output.");
+        }
+
+        emitEvent({
+          type: "complete",
+          request_id: payload.request_id,
+          text: fullText,
+        });
+      } catch (error) {
+        emitEvent({
+          type: "error",
+          request_id: payload.request_id,
+          message: error && error.message ? error.message : String(error),
+        });
+      }
+    };
+
+    waitForPuter();
+  </script>
+</body>
+</html>

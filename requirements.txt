@@ -4,6 +4,7 @@ mcp
 langgraph
 langchain-google-genai
 langchain-ollama
+langchain-openai
 langchain-mcp-adapters
 PySide6
 fastapi>=0.111.0

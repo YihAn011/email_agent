@@ -56,6 +56,16 @@ def _parse_eml_preview(path: Path) -> dict:
         return {"subject": "(unreadable)", "from_address": ""}
 
 
+def _resolve_email_path(uid: int) -> tuple[str, Path]:
+    mailboxes = list_mailboxes()
+    for mailbox in mailboxes:
+        email_address = str(mailbox["email_address"])
+        path = MESSAGES_DIR / sanitize_mailbox_dir(email_address) / f"{uid}.eml"
+        if path.exists():
+            return email_address, path
+    raise HTTPException(status_code=404, detail="Email not found")
+
+
 @app.get("/api/emails")
 def api_emails() -> list[dict]:
     analyzed: dict[tuple[str, int], dict] = {}
@@ -103,41 +113,50 @@ def api_emails() -> list[dict]:
 
 @app.get("/api/email/{uid}/raw")
 def api_email_raw(uid: int) -> dict:
-    mailboxes = list_mailboxes()
-    for mailbox in mailboxes:
-        email_address = str(mailbox["email_address"])
-        path = MESSAGES_DIR / sanitize_mailbox_dir(email_address) / f"{uid}.eml"
-        if path.exists():
-            msg = stdlib_email.message_from_string(
-                path.read_text(encoding="utf-8", errors="replace")
-            )
-            body = ""
-            if msg.is_multipart():
-                plain_body = ""
-                html_body = ""
-                for part in msg.walk():
-                    ct = part.get_content_type()
-                    if ct in ("text/plain", "text/html"):
-                        try:
-                            decoded = part.get_payload(decode=True).decode(
-                                part.get_content_charset() or "utf-8", errors="replace"
-                            )
-                            if ct == "text/plain":
-                                plain_body = decoded
-                            else:
-                                html_body = decoded
-                        except Exception:
-                            pass
-                body = plain_body or html_body
-            else:
+    email_address, path = _resolve_email_path(uid)
+    msg = stdlib_email.message_from_string(
+        path.read_text(encoding="utf-8", errors="replace")
+    )
+    body = ""
+    if msg.is_multipart():
+        plain_body = ""
+        html_body = ""
+        for part in msg.walk():
+            ct = part.get_content_type()
+            if ct in ("text/plain", "text/html"):
                 try:
-                    body = msg.get_payload(decode=True).decode(
-                        msg.get_content_charset() or "utf-8", errors="replace"
+                    decoded = part.get_payload(decode=True).decode(
+                        part.get_content_charset() or "utf-8", errors="replace"
                     )
+                    if ct == "text/plain":
+                        plain_body = decoded
+                    else:
+                        html_body = decoded
                 except Exception:
-                    body = str(msg.get_payload())
-            return {"uid": uid, "body": body}
-    raise HTTPException(status_code=404, detail="Email not found")
+                    pass
+        body = plain_body or html_body
+    else:
+        try:
+            body = msg.get_payload(decode=True).decode(
+                msg.get_content_charset() or "utf-8", errors="replace"
+            )
+        except Exception:
+            body = str(msg.get_payload())
+    return {"uid": uid, "email_address": email_address, "body": body}
+
+
+@app.get("/api/email/{uid}/source")
+def api_email_source(uid: int) -> dict:
+    email_address, path = _resolve_email_path(uid)
+    raw_email = path.read_text(encoding="utf-8", errors="replace")
+    msg = stdlib_email.message_from_string(raw_email)
+    return {
+        "uid": uid,
+        "email_address": email_address,
+        "subject": msg.get("Subject", "(no subject)"),
+        "from_address": msg.get("From", ""),
+        "raw_email": raw_email,
+    }
 
 
 @app.get("/api/stream/{uid}")

@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Puter Sign In</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0f172a;
+      color: #e2e8f0;
+      font-family: Arial, sans-serif;
+    }
+    .card {
+      width: min(420px, calc(100vw - 32px));
+      background: #111827;
+      border: 1px solid #334155;
+      border-radius: 16px;
+      padding: 24px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+    }
+    h1 {
+      margin: 0 0 12px;
+      font-size: 22px;
+    }
+    p {
+      margin: 0 0 12px;
+      color: #94a3b8;
+      line-height: 1.5;
+    }
+    button {
+      width: 100%;
+      padding: 12px 16px;
+      border: 0;
+      border-radius: 10px;
+      background: #2563eb;
+      color: white;
+      font-size: 15px;
+      cursor: pointer;
+      margin-top: 8px;
+    }
+    button:hover {
+      background: #1d4ed8;
+    }
+    #status {
+      margin-top: 14px;
+      min-height: 22px;
+      color: #cbd5e1;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Sign In To Puter</h1>
+    <p>This is a one-time sign-in so the desktop chat can use Puter's frontend free model access in the same chat UI.</p>
+    <p>After sign-in finishes, this window will close and your last message will retry automatically.</p>
+    <button id="sign-in">Continue With Puter</button>
+    <div id="status">Loading Puter SDK...</div>
+  </div>
+
+  <script src="https://js.puter.com/v2/"></script>
+  <script>
+    const PREFIX = "__PUTER_AUTH__";
+    const statusEl = document.getElementById("status");
+
+    function emit(payload) {
+      console.log(PREFIX + JSON.stringify(payload));
+    }
+
+    async function waitForPuter() {
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < 15000) {
+        if (window.puter && window.puter.auth) {
+          statusEl.textContent = "Ready. Click the button to sign in.";
+          emit({ type: "ready" });
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      statusEl.textContent = "Timed out waiting for Puter SDK.";
+      emit({ type: "error", message: "Timed out waiting for Puter sign-in page to load." });
+    }
+
+    document.getElementById("sign-in").addEventListener("click", async () => {
+      try {
+        statusEl.textContent = "Opening Puter sign-in...";
+        await window.puter.auth.signIn({ attempt_temp_user_creation: true });
+        const deadline = Date.now() + 10000;
+        while (Date.now() < deadline) {
+          if (typeof window.puter.auth.isSignedIn === "function" && window.puter.auth.isSignedIn()) {
+            statusEl.textContent = "Sign-in complete.";
+            emit({ type: "success" });
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+        throw new Error("Puter sign-in did not persist in this session.");
+      } catch (error) {
+        statusEl.textContent = "Sign-in failed.";
+        emit({
+          type: "error",
+          message: error && error.message ? error.message : String(error),
+        });
+      }
+    });
+
+    waitForPuter();
+  </script>
+</body>
+</html>

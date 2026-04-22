@@ -3,11 +3,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import html
+import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
+import time
 from email import policy
 from email.parser import BytesParser
 from html.parser import HTMLParser
@@ -73,6 +76,8 @@ from skills.error_patterns.schemas import ErrorPatternMemoryCheckInput, ListErro
 from skills.error_patterns.skill import ErrorPatternMemoryCheckSkill, ListErrorPatternsSkill
 from skills.rspamd.schemas import RspamdScanEmailInput
 from skills.rspamd.skill import RspamdScanEmailSkill
+from skills.scam_indicators.schemas import ScamIndicatorCheckInput
+from skills.scam_indicators.skill import ScamIndicatorCheckSkill
 from skills.urgency.schemas import UrgencyCheckInput
 from skills.urgency.skill import UrgencyCheckSkill
 from skills.url_reputation.schemas import UrlReputationInput
@@ -92,6 +97,9 @@ BALL_SIZE = 72
 PANEL_SIZE = QSize(1180, 680)
 DRAG_HOLD_MS = 250
 EMAIL_PAGE_SIZE = 10
+PUTER_PROVIDER = "puter-openai"
+PUTER_WEB_PORT = 8765
+PUTER_BRIDGE_LOG = "/tmp/email_agent_puter_bridge.log"
 
 
 def _child_pids(parent: int) -> list[int]:
@@ -126,6 +134,131 @@ def _sigterm_pid(pid: int) -> None:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
+
+
+def _desktop_model_default(provider: str) -> str:
+    if provider == PUTER_PROVIDER:
+        return "gpt-5.4"
+    return resolve_default_model(provider)
+
+
+def _port_open(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.25)
+        return sock.connect_ex((host, port)) == 0
+
+
+def _wait_for_port(host: str, port: int, timeout_s: float = 10.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if _port_open(host, port):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+class PuterBridgeController(QObject):
+    ready = Signal()
+    chunk = Signal(int, str, str)
+    completed = Signal(int, str)
+    failed = Signal(int, str)
+    auth_required = Signal(int, str)
+
+    def __init__(self, bridge_url: str, profile=None, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._bridge_url = bridge_url
+        self._profile = profile
+        self._page = None
+        self._ready = False
+        self._pending_submission: tuple[list[dict[str, str]], str, int] | None = None
+
+    @property
+    def is_ready(self) -> bool:
+        return self._ready
+
+    def ensure_loaded(self) -> None:
+        if self._page is not None:
+            return
+
+        try:
+            from PySide6.QtCore import QUrl
+            from PySide6.QtWebEngineCore import QWebEnginePage
+            from PySide6.QtWebEngineCore import QWebEngineSettings
+        except Exception as exc:
+            self.failed.emit(0, f"Qt WebEngine is unavailable: {exc}")
+            return
+
+        controller = self
+
+        class _BridgePage(QWebEnginePage):
+            def javaScriptConsoleMessage(self, level, message, line_number, source_id):  # type: ignore[override]
+                del level, line_number, source_id
+                controller._handle_console_message(message)
+
+        if self._profile is not None:
+            self._page = _BridgePage(self._profile, self)
+        else:
+            self._page = _BridgePage(self)
+        self._page.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls,
+            True,
+        )
+        self._page.load(QUrl(self._bridge_url))
+
+    def reload(self) -> None:
+        self._ready = False
+        self._pending_submission = None
+        if self._page is not None:
+            self._page.triggerAction(self._page.WebAction.ReloadAndBypassCache)
+
+    def submit(self, messages: list[dict[str, str]], model: str, request_id: int) -> None:
+        self.ensure_loaded()
+        if self._page is None:
+            return
+        if not self._ready:
+            self._pending_submission = (messages, model, request_id)
+            return
+        payload = {
+            "messages": messages,
+            "model": model,
+            "request_id": request_id,
+        }
+        script = f"window.__puterBridgeSubmit({json.dumps(payload)});"
+        self._page.runJavaScript(script)
+
+    def _handle_console_message(self, message: str) -> None:
+        prefix = "__PUTER_EVENT__"
+        if not message.startswith(prefix):
+            return
+        try:
+            payload = json.loads(message[len(prefix):])
+        except json.JSONDecodeError:
+            return
+        event_type = str(payload.get("type", ""))
+        request_id = int(payload.get("request_id", 0) or 0)
+        if event_type == "ready":
+            self._ready = True
+            self.ready.emit()
+            if self._pending_submission is not None:
+                messages, model, pending_request_id = self._pending_submission
+                self._pending_submission = None
+                self.submit(messages, model, pending_request_id)
+            return
+        if event_type == "chunk":
+            self.chunk.emit(
+                request_id,
+                str(payload.get("text", "")),
+                str(payload.get("full_text", "")),
+            )
+            return
+        if event_type == "complete":
+            self.completed.emit(request_id, str(payload.get("text", "")))
+            return
+        if event_type == "auth_required":
+            self.auth_required.emit(request_id, str(payload.get("message", "Puter authentication required")))
+            return
+        if event_type == "error":
+            self.failed.emit(request_id, str(payload.get("message", "Unknown Puter error")))
 
 
 def terminate_stack_child_pids_from_env() -> None:
@@ -396,21 +529,20 @@ def build_referenced_email_prompt(question: str, referenced_emails: list[dict[st
             )
         return build_analysis_prompt(
             question
-            + "\nMandatory: do not answer before using tools. First call list_error_patterns, then rspamd_scan_email with raw_email, url_reputation_check with email_text, urgency_check with email_text, then error_pattern_memory_check."
+            + "\nWorkflow: first call rspamd_scan_email with raw_email. If the Rspamd score is greater than 7, choose any additional relevant MCP tools before the final verdict."
             + "\nUse the short four-part template: Email, Type, Verdict, Evidence. "
             "The Verdict line must be exactly one of Normal, Spam, Phishing. "
             "Call rspamd_scan_email with raw_email equal to the complete raw RFC822 block; do not pass a summary, body-only text, JSON object, extracted fields, or email_text to rspamd_scan_email. "
             "Use email_text only for url_reputation_check and urgency_check. "
-            "Before choosing Spam or Phishing, use multiple available checks, especially URL reputation, urgency, and error-pattern memory. "
+            "When extra checks are needed, prefer URL reputation, urgency, header authentication, and error-pattern memory. "
             "Use header authentication only if you can pass the complete raw RFC822 block as a string. "
-            "Do not use Rspamd score alone as the verdict. "
             "Keep it brief unless the user asks for more detail.",
             raw_email=f"BEGIN RAW RFC822\n{raw_email}\nEND RAW RFC822",
         )
 
     sections = [
         question,
-        "Mandatory: do not answer before using tools. First call list_error_patterns, then analyze each raw RFC822 email with rspamd_scan_email, url_reputation_check, urgency_check, and finally error_pattern_memory_check.",
+        "Workflow: for each raw RFC822 email, first call rspamd_scan_email. If its Rspamd score is greater than 7, choose any additional relevant MCP tools before the final verdict.",
         "There are multiple referenced emails below. Do not treat them as one combined email.",
         "Analyze each referenced email separately for phishing, spam, sender authenticity, urgency, and suspicious links.",
         "Your final answer must contain one short labeled section per email: Email 1, Email 2, Email 3 as applicable.",
@@ -418,20 +550,17 @@ def build_referenced_email_prompt(question: str, referenced_emails: list[dict[st
         "Email: <subject or short name>",
         "Type: <business/school/recruiting/financial/account security/delivery/marketing/general notification/etc.>",
         "Verdict: <Normal | Spam | Phishing>",
-        "Evidence:",
-        "- <called tool/skill name>: <one short evidence sentence>",
-        "- Inference: <one short sentence if needed>",
+        "Why this conclusion:",
+        "- <plain-language reason a non-technical user can understand>",
+        "- <another short reason if needed>",
         "The Verdict line must choose exactly one of Normal, Spam, Phishing.",
         "Call rspamd_scan_email with raw_email equal to the complete raw RFC822 block; do not pass a summary, body-only text, JSON object, extracted fields, or email_text to rspamd_scan_email.",
         "Use email_text only for url_reputation_check and urgency_check.",
-        "Before choosing Spam or Phishing, use multiple available checks, especially URL reputation, urgency, and error-pattern memory.",
+        "When extra checks are needed, prefer URL reputation, urgency, header authentication, and error-pattern memory.",
         "Use header authentication only if you can pass the complete raw RFC822 block as a string.",
-        "Do not use Rspamd score alone as the verdict.",
         "Keep the answer brief. Do not write a long security report unless the user asks follow-up questions.",
         "Only mention tools/skills that were actually called or are available locally.",
         "If tools are unavailable or only one tool runs, still provide a plain-language assessment for every referenced email from the visible content.",
-        "",
-        "Required workflow: first call `list_error_patterns`, then run the normal security tools where possible, then call `error_pattern_memory_check` before the final verdict.",
     ]
     for index, item in enumerate(referenced_emails, 1):
         raw_email = str(item.get("raw_email") or "").strip()
@@ -481,20 +610,21 @@ def _email_item_from_raw_text(raw_email: str) -> dict[str, str]:
     }
 
 
-def _obvious_phishing_reasons(raw_email: str, subject: str, from_address: str) -> list[str]:
-    text = f"{subject}\n{from_address}\n{raw_email}".lower()
-    reasons: list[str] = []
-    if "paypal" in text and not any(domain in from_address.lower() for domain in ("@paypal.com", ".paypal.com")):
-        reasons.append("PayPal branding is used from a non-PayPal sender domain.")
-    if "paypai" in text or "paypaı" in text or "paypa1" in text or "payi" in text or "paypaI".lower() in text:
-        reasons.append("The message uses a PayPal lookalike spelling or domain.")
-    if re.search(r"https?://[^\s\"'<>]*(?:\.tk|secure-verify|restore-account|urgent)", text):
-        reasons.append("The message contains a suspicious account-restore URL.")
-    if any(token in text for token in ("final warning", "permanent close", "permanently delete", "verify now", "2 hours", "120 minutes")):
-        reasons.append("The message uses urgent account-closure pressure.")
-    if "reply-to:" in text and "gmail.com" in text and "paypal" in text:
-        reasons.append("Reply-To points to a free-mail account while impersonating PayPal.")
-    return reasons[:4]
+def _extra_checks_strongly_benign(
+    url_data: dict[str, Any],
+    urgency_data: dict[str, Any],
+    memory_data: dict[str, Any],
+) -> bool:
+    url_risk = str(url_data.get("risk_level") or "").lower()
+    urgency_risk = str(urgency_data.get("risk_contribution") or "").lower()
+    urgency_label = str(urgency_data.get("urgency_label") or "").lower()
+    return (
+        url_risk in {"", "low", "unknown"}
+        and not bool(url_data.get("is_suspicious"))
+        and urgency_risk in {"", "low", "unknown"}
+        and urgency_label in {"", "not urgent", "unknown"}
+        and not bool(memory_data.get("matched"))
+    )
 
 
 def _direct_email_analysis(
@@ -527,10 +657,8 @@ def _direct_email_analysis(
             lines.extend(
                 [
                     "Verdict: Normal",
-                    "Evidence:",
-                    "- IMAP: original raw RFC822 content was not available, so no scanner-backed spam or phishing evidence was found.",
-                    "",
-                    "Tools: none",
+                    "Why this conclusion:",
+                    "- The original raw email content was not available, so there were no scanner-backed signs of spam or phishing to report.",
                 ]
             )
             sections.append("\n".join(lines))
@@ -542,122 +670,148 @@ def _direct_email_analysis(
         )
         rspamd_data = rspamd_result.data.model_dump() if rspamd_result.ok and rspamd_result.data else {}
         rspamd_score = float(rspamd_data.get("score") or 0.0)
-        obvious_phishing_reasons = _obvious_phishing_reasons(raw_email, subject, from_address)
+        run_extra_tools = rspamd_score > rspamd_spam_threshold
+        url_result = None
+        urgency_result = None
+        patterns_result = None
+        memory_result = None
+        scam_result = None
+        scam_data: dict[str, Any] = {}
+        obvious_phishing_reasons: list[str] = []
+        url_data: dict[str, Any] = {}
+        urgency_data: dict[str, Any] = {}
 
-        if rspamd_result.ok and rspamd_score < rspamd_spam_threshold and not obvious_phishing_reasons:
-            lines.extend(
-                [
-                    "Verdict: Normal",
-                    "Evidence:",
-                    "- rspamd_scan_email: "
-                    + f"score={rspamd_score}, below spam threshold {rspamd_spam_threshold}; "
-                    + f"risk={rspamd_data.get('risk_level', 'unknown')}, action={rspamd_data.get('action', 'unknown')}.",
-                    "- Inference: Rspamd score is below the configured spam threshold, so no extra tools were needed.",
-                    "",
-                    "Tools: `rspamd_scan_email`",
-                ]
-            )
-            sections.append("\n".join(lines))
-            continue
-
-        body_text = _mail_body_text(raw_email.encode("utf-8", errors="replace")) or raw_email
-        if obvious_phishing_reasons:
-            progress.emit("Strong phishing indicators found; running additional checks")
-        else:
-            progress.emit("Rspamd score reached threshold; running additional checks")
-        progress.emit("Checking links and URL reputation")
-        url_result = UrlReputationSkill().run(UrlReputationInput(email_text=body_text, subject=subject))
-        progress.emit("Scoring urgency and pressure signals")
-        urgency_result = UrgencyCheckSkill().run(UrgencyCheckInput(email_text=body_text, subject=subject))
-        progress.emit("Loading stored error patterns")
-        patterns_result = ListErrorPatternsSkill().run(ListErrorPatternsInput(limit=20))
-
-        url_data = url_result.data.model_dump() if url_result.ok and url_result.data else {}
-        urgency_data = urgency_result.data.model_dump() if urgency_result.ok and urgency_result.data else {}
-        decision = "Phishing" if obvious_phishing_reasons else _required_decision_label(
-            rspamd_data,
-            None,
-            url_data,
-            urgency_data,
-            subject,
-            from_address,
-        )
-        current_verdict = "benign" if decision == "Normal" else "suspicious"
-
-        progress.emit("Checking known error patterns")
-        memory_result = ErrorPatternMemoryCheckSkill().run(
-            ErrorPatternMemoryCheckInput(
-                subject=subject,
-                from_address=from_address,
-                current_verdict=current_verdict,
-                rspamd_risk_level=str(rspamd_data.get("risk_level") or "") or None,
-                urgency_label=str(urgency_data.get("urgency_label") or "") or None,
-                url_risk_level=str(url_data.get("risk_level") or "") or None,
-            )
-        )
-        memory_data = memory_result.data.model_dump() if memory_result.ok and memory_result.data else {}
-        if not obvious_phishing_reasons and memory_data.get("matched") and memory_data.get("suggested_verdict") == "benign":
-            decision = "Normal"
-
-        lines.extend([f"Verdict: {decision}", "Evidence:"])
-        if rspamd_result.ok:
-            lines.append(
-                "- rspamd_scan_email: "
-                + f"risk={rspamd_data.get('risk_level', 'unknown')}, "
-                + f"score={rspamd_data.get('score', 'unknown')}, "
-                + f"action={rspamd_data.get('action', 'unknown')}; "
-                + (
-                    "strong phishing indicators triggered extra checks."
-                    if obvious_phishing_reasons and rspamd_score < rspamd_spam_threshold
-                    else f"score met threshold {rspamd_spam_threshold}, so extra checks were run."
+        if run_extra_tools:
+            body_text = _mail_body_text(raw_email.encode("utf-8", errors="replace")) or raw_email
+            progress.emit("Rspamd score is above 7; running additional MCP tools")
+            progress.emit("Checking obvious scam indicators")
+            scam_result = ScamIndicatorCheckSkill().run(
+                ScamIndicatorCheckInput(
+                    raw_email=raw_email,
+                    subject=subject,
+                    from_address=from_address,
                 )
             )
-        else:
-            lines.append(f"- {_skill_error_text('rspamd_scan_email', rspamd_result)}")
+            scam_data = scam_result.data.model_dump() if scam_result.ok and scam_result.data else {}
+            obvious_phishing_reasons = list(scam_data.get("reasons") or [])
+            progress.emit("Checking links and URL reputation")
+            url_result = UrlReputationSkill().run(UrlReputationInput(email_text=body_text, subject=subject))
+            progress.emit("Scoring urgency and pressure signals")
+            urgency_result = UrgencyCheckSkill().run(UrgencyCheckInput(email_text=body_text, subject=subject))
+            progress.emit("Loading stored error patterns")
+            patterns_result = ListErrorPatternsSkill().run(ListErrorPatternsInput(limit=20))
 
-        if url_result.ok:
+            url_data = url_result.data.model_dump() if url_result.ok and url_result.data else {}
+            urgency_data = urgency_result.data.model_dump() if urgency_result.ok and urgency_result.data else {}
+
+        decision = (
+            "Phishing"
+            if obvious_phishing_reasons
+            else _required_decision_label(
+                rspamd_data,
+                None,
+                url_data if run_extra_tools else None,
+                urgency_data if run_extra_tools else None,
+                subject,
+                from_address,
+            )
+        )
+
+        memory_data: dict[str, Any] = {}
+        if run_extra_tools:
+            current_verdict = "benign" if decision == "Normal" else "suspicious"
+            progress.emit("Checking known error patterns")
+            memory_result = ErrorPatternMemoryCheckSkill().run(
+                ErrorPatternMemoryCheckInput(
+                    subject=subject,
+                    from_address=from_address,
+                    current_verdict=current_verdict,
+                    rspamd_risk_level=str(rspamd_data.get("risk_level") or "") or None,
+                    urgency_label=str(urgency_data.get("urgency_label") or "") or None,
+                    url_risk_level=str(url_data.get("risk_level") or "") or None,
+                )
+            )
+            memory_data = memory_result.data.model_dump() if memory_result.ok and memory_result.data else {}
+            if (
+                not obvious_phishing_reasons
+                and memory_data.get("matched")
+                and memory_data.get("suggested_verdict") == "benign"
+            ):
+                decision = "Normal"
+
+        if (
+            not obvious_phishing_reasons
+            and rspamd_score > 10
+            and decision == "Normal"
+            and not _extra_checks_strongly_benign(url_data, urgency_data, memory_data)
+        ):
+            decision = "Spam"
+
+        lines.extend([f"Verdict: {decision}", "Why this conclusion:"])
+        if rspamd_result.ok:
             lines.append(
-                "- url_reputation_check: "
-                + f"risk={url_data.get('risk_level', 'unknown')}, "
-                + f"phishing_score={url_data.get('phishing_score', 'unknown')}."
+                "- The message content and structure were rated "
+                + f"{rspamd_data.get('risk_level', 'unknown')} risk "
+                + f"(score {rspamd_data.get('score', 'unknown')})."
             )
         else:
-            lines.append(f"- {_skill_error_text('url_reputation_check', url_result)}")
+            lines.append("- The main content scan could not be completed, so the verdict is based on the remaining available context.")
 
-        if urgency_result.ok:
-            lines.append(
-                "- urgency_check: "
-                + f"{urgency_data.get('urgency_label', 'unknown')}, "
-                + f"score={urgency_data.get('urgency_score', 'unknown')}."
-            )
-        else:
-            lines.append(f"- {_skill_error_text('urgency_check', urgency_result)}")
+        if url_result is not None:
+            if url_result.ok:
+                lines.append(
+                    "- The links and URL patterns looked "
+                    + f"{url_data.get('risk_level', 'unknown')} risk "
+                    + f"(phishing score {url_data.get('phishing_score', 'unknown')})."
+                )
+            else:
+                lines.append("- The link-safety check could not be completed.")
 
-        if memory_result.ok:
-            lines.append(
-                "- error_pattern_memory_check: "
-                + f"matched={memory_data.get('matched', False)}, "
-                + f"suggested={memory_data.get('suggested_verdict')}."
-            )
-        else:
-            lines.append(f"- {_skill_error_text('error_pattern_memory_check', memory_result)}")
+        if urgency_result is not None:
+            if urgency_result.ok:
+                lines.append(
+                    "- The wording was "
+                    + f"{urgency_data.get('urgency_label', 'unknown')} "
+                    + f"(pressure score {urgency_data.get('urgency_score', 'unknown')})."
+                )
+            else:
+                lines.append("- The urgency/pressure check could not be completed.")
 
-        if patterns_result.ok and patterns_result.data:
-            lines.append(f"- list_error_patterns: loaded {len(patterns_result.data.entries)} stored error patterns.")
+        if memory_result is not None:
+            if memory_result.ok:
+                if memory_data.get("matched"):
+                    lines.append("- Similar past analysis patterns were found and considered before choosing the verdict.")
+                else:
+                    lines.append("- No similar past mistake pattern changed the verdict.")
+            else:
+                lines.append("- The past-pattern comparison could not be completed.")
+
+        if patterns_result is not None:
+            if patterns_result.ok and patterns_result.data:
+                lines.append(f"- I compared the result against {len(patterns_result.data.entries)} stored past-error patterns.")
+            elif not patterns_result.ok:
+                lines.append("- Stored past-error patterns could not be loaded.")
+
         for reason in obvious_phishing_reasons:
-            lines.append(f"- Heuristic: {reason}")
+            lines.append(f"- {reason}")
 
         if decision == "Normal" and float(rspamd_data.get("score") or 0.0) >= 6:
-            lines.append("- Inference: Rspamd was not used alone as the verdict because URL and urgency checks did not corroborate Spam or Phishing.")
-
-        tools = [
-            "rspamd_scan_email",
-            "url_reputation_check",
-            "urgency_check",
-            "list_error_patterns",
-            "error_pattern_memory_check",
-        ]
-        lines.extend(["", "Tools: " + ", ".join(f"`{name}`" for name in tools)])
+            if rspamd_score > 10:
+                lines.append("- Even though the scanner score was high, the extra checks gave a clear benign explanation, so it was not called spam or phishing.")
+            else:
+                lines.append("- Even though the scanner score was somewhat elevated, the extra checks did not support calling it spam or phishing.")
+        tools = ["rspamd_scan_email"]
+        if scam_result is not None:
+            tools.append("scam_indicator_check")
+        if url_result is not None:
+            tools.append("url_reputation_check")
+        if urgency_result is not None:
+            tools.append("urgency_check")
+        if patterns_result is not None:
+            tools.append("list_error_patterns")
+        if memory_result is not None:
+            tools.append("error_pattern_memory_check")
+        lines.extend(["", "Tools called: " + ", ".join(f"`{name}`" for name in tools)])
         sections.append("\n".join(lines))
 
     progress.emit("Preparing the final answer")
@@ -761,12 +915,8 @@ class AgentWorker(QObject):
             self.result.emit(render_trace(messages, start_idx))
         elif self.prefer_ai_response:
             body = latest_ai_message(messages).strip()
-            tool_list = summarize_invoked_tools(messages, start_idx)
             if body:
-                rendered = body
-                if tool_list:
-                    rendered = f"Tools: {tool_list}\n\n{body}"
-                self.result.emit(rendered)
+                self.result.emit(body)
             else:
                 self.result.emit(render_chat_response(messages, start_idx))
         else:
@@ -946,6 +1096,17 @@ class PetWindow(QMainWindow):
         self.worker: AgentWorker | None = None
         self.mail_thread: QThread | None = None
         self.mail_worker: MailboxWorker | None = None
+        self.puter_bridge: PuterBridgeController | None = None
+        self.puter_history: list[dict[str, str]] = []
+        self.puter_pending_messages: list[dict[str, str]] | None = None
+        self.puter_active_request_id: int | None = None
+        self.puter_next_request_id = 1
+        self.puter_profile = None
+        self.puter_server_process: subprocess.Popen[str] | None = None
+        self.puter_auth_window = None
+        self.puter_auth_view = None
+        self.puter_auth_in_progress = False
+        self.puter_retry_after_auth = False
         self.loaded_email_count = 0
         self.referenced_emails: list[dict[str, str]] = []
         self.expanded = False
@@ -987,6 +1148,7 @@ class PetWindow(QMainWindow):
         self.resize(BALL_SIZE, BALL_SIZE)
         self._place_bottom_right()
         self.refresh_mailboxes()
+        self._sync_provider_ui(self.args.provider)
         QTimer.singleShot(250, self.initialize_runtime)
 
     def _build_panel(self) -> QWidget:
@@ -1024,13 +1186,13 @@ class PetWindow(QMainWindow):
         model_label = QLabel("Model")
         model_label.setObjectName("sectionLabel")
         self.provider_combo = QComboBox()
-        self.provider_combo.addItems(["gemini", "ollama"])
-        self.provider_combo.setCurrentText(self.args.provider)
-        self.provider_combo.currentTextChanged.connect(self.update_model_default)
+        self.provider_combo.addItems(["gemini", "ollama", PUTER_PROVIDER])
         self.model_input = QLineEdit(self.args.model)
         self.model_input.setPlaceholderText("model name")
         self.switch_model_button = QPushButton("Switch Model")
         self.switch_model_button.clicked.connect(self.switch_model)
+        self.provider_combo.setCurrentText(self.args.provider)
+        self.provider_combo.currentTextChanged.connect(self.update_model_default)
         side_layout.addWidget(model_label)
         side_layout.addWidget(self.provider_combo)
         side_layout.addWidget(self.model_input)
@@ -1425,7 +1587,282 @@ class PetWindow(QMainWindow):
         self.status_label.setText(text)
 
     def initialize_runtime(self) -> None:
+        if self.args.provider == PUTER_PROVIDER:
+            self.progress.clear()
+            self.set_progress_state("success")
+            self.append_progress(f"Puter frontend bridge will initialize on the first request for {self.args.model}")
+            self.set_status("ready", f"Ready: {self.args.provider} / {self.args.model}")
+            return
         self._run_agent("", hidden=True, setup_only=True)
+
+    def _sync_provider_ui(self, provider: str) -> None:
+        is_puter = provider == PUTER_PROVIDER
+        if hasattr(self, "send_button"):
+            self.send_button.setEnabled(True)
+            self.send_button.setText("Send")
+        if not hasattr(self, "input"):
+            return
+        self.input.setReadOnly(False)
+        if is_puter:
+            self.input.setPlaceholderText(
+                "Ask anything. Puter OpenAI now runs in the same chat UI as the other providers."
+            )
+        else:
+            self.input.setPlaceholderText("Ask anything, or paste a raw email/header here.")
+
+    def _puter_bridge_url(self) -> str:
+        return f"http://127.0.0.1:{PUTER_WEB_PORT}/static/puter_bridge.html"
+
+    def _puter_auth_url(self) -> str:
+        return f"http://127.0.0.1:{PUTER_WEB_PORT}/static/puter_auth.html"
+
+    def _ensure_puter_local_server(self) -> None:
+        if _port_open("127.0.0.1", PUTER_WEB_PORT):
+            return
+        if self.puter_server_process is not None and self.puter_server_process.poll() is None:
+            if _wait_for_port("127.0.0.1", PUTER_WEB_PORT, timeout_s=2.0):
+                return
+
+        self.puter_server_process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "web.server:app",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(PUTER_WEB_PORT),
+            ],
+            cwd=str(PROJECT_ROOT),
+            stdout=open(PUTER_BRIDGE_LOG, "a", encoding="utf-8"),
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if not _wait_for_port("127.0.0.1", PUTER_WEB_PORT, timeout_s=10.0):
+            raise RuntimeError(
+                f"Timed out starting the local Puter bridge server on port {PUTER_WEB_PORT}. "
+                f"See {PUTER_BRIDGE_LOG} for details."
+            )
+
+    def _ensure_puter_bridge(self) -> PuterBridgeController:
+        self._ensure_puter_local_server()
+        if self.puter_profile is None:
+            from PySide6.QtWebEngineCore import QWebEngineProfile
+
+            self.puter_profile = QWebEngineProfile("puter_shared_profile", self)
+        if self.puter_bridge is None:
+            bridge = PuterBridgeController(self._puter_bridge_url(), self.puter_profile, self)
+            bridge.ready.connect(self._puter_bridge_ready)
+            bridge.chunk.connect(self._puter_bridge_chunk)
+            bridge.completed.connect(self._puter_bridge_completed)
+            bridge.auth_required.connect(self._puter_bridge_auth_required)
+            bridge.failed.connect(self._puter_bridge_failed)
+            bridge.ensure_loaded()
+            self.puter_bridge = bridge
+        return self.puter_bridge
+
+    def _puter_bridge_ready(self) -> None:
+        if self.args.provider != PUTER_PROVIDER:
+            return
+        if self.puter_retry_after_auth and self.puter_bridge is not None and self.puter_pending_messages is not None and self.puter_active_request_id is not None:
+            self.puter_retry_after_auth = False
+            self.append_progress("Puter session refreshed. Retrying request.")
+            self.puter_bridge.submit(self.puter_pending_messages, self.args.model, self.puter_active_request_id)
+            return
+        if self.puter_active_request_id is None:
+            self.set_progress_state("success")
+            self.set_status("ready", f"Ready: {self.args.provider} / {self.args.model}")
+
+    def _puter_bridge_chunk(self, request_id: int, _text: str, full_text: str) -> None:
+        if request_id != self.puter_active_request_id:
+            return
+        self.progress.setPlainText(full_text)
+        self.progress.verticalScrollBar().setValue(self.progress.verticalScrollBar().maximum())
+
+    def _finish_puter_request(self) -> None:
+        self.puter_active_request_id = None
+        self.puter_pending_messages = None
+        self.send_button.setEnabled(True)
+        self.set_status("ready", f"Ready: {self.args.provider} / {self.args.model}")
+
+    def _ensure_puter_auth_window(self) -> None:
+        if self.puter_auth_window is not None:
+            return
+
+        from PySide6.QtCore import QUrl
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+        from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
+
+        self._ensure_puter_bridge()
+
+        window = QMainWindow(self)
+        window.setWindowTitle("Email Guardian · Sign In To Puter")
+        view = QWebEngineView(window)
+
+        controller = self
+        popup_windows: list[QMainWindow] = []
+
+        class _AuthPage(QWebEnginePage):
+            def createWindow(self, window_type):  # type: ignore[override]
+                del window_type
+                popup_window = QMainWindow()
+                popup_window.setWindowTitle("Puter Sign In")
+                popup_view = QWebEngineView(popup_window)
+                popup_page = QWebEnginePage(controller.puter_profile, popup_view)
+                popup_view.setPage(popup_page)
+                popup_window.setCentralWidget(popup_view)
+                popup_window.resize(520, 720)
+                popup_window.show()
+                popup_windows.append(popup_window)
+
+                def _cleanup_popup() -> None:
+                    try:
+                        popup_windows.remove(popup_window)
+                    except ValueError:
+                        pass
+
+                popup_window.destroyed.connect(_cleanup_popup)
+                return popup_page
+
+            def javaScriptConsoleMessage(self, level, message, line_number, source_id):  # type: ignore[override]
+                del level, line_number, source_id
+                prefix = "__PUTER_AUTH__"
+                if not message.startswith(prefix):
+                    return
+                try:
+                    payload = json.loads(message[len(prefix):])
+                except json.JSONDecodeError:
+                    return
+                auth_type = str(payload.get("type", ""))
+                auth_message = str(payload.get("message", ""))
+                if auth_type == "ready":
+                    controller.append_progress("Puter sign-in window is ready")
+                elif auth_type == "success":
+                    controller._puter_auth_succeeded()
+                elif auth_type == "error":
+                    controller._puter_auth_failed(auth_message or "Puter sign-in failed")
+
+        page = _AuthPage(self.puter_profile, view)
+        page.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls,
+            True,
+        )
+        view.setPage(page)
+        view.load(QUrl(self._puter_auth_url()))
+        window.setCentralWidget(view)
+        window.resize(520, 720)
+        self.puter_auth_window = window
+        self.puter_auth_view = view
+
+    def _puter_bridge_auth_required(self, request_id: int, message: str) -> None:
+        if request_id != self.puter_active_request_id:
+            return
+        self.puter_auth_in_progress = True
+        self.set_progress_state("busy")
+        self.set_status("starting", "Puter sign-in required")
+        self.append_progress(message)
+        self.append_progress("A one-time Puter sign-in window is opening. Complete it, then the message will retry automatically.")
+        self._ensure_puter_auth_window()
+        self.puter_auth_window.show()
+        self.puter_auth_window.raise_()
+        self.puter_auth_window.activateWindow()
+
+    def _puter_auth_succeeded(self) -> None:
+        self.puter_auth_in_progress = False
+        if self.puter_auth_window is not None:
+            self.puter_auth_window.hide()
+        self.append_progress("Puter sign-in completed. Refreshing session before retry.")
+        if self.puter_bridge is None or self.puter_pending_messages is None or self.puter_active_request_id is None:
+            self.set_progress_state("success")
+            self.set_status("ready", f"Ready: {self.args.provider} / {self.args.model}")
+            self.send_button.setEnabled(True)
+            return
+        self.puter_retry_after_auth = True
+        self.puter_bridge.reload()
+
+    def _puter_auth_failed(self, message: str) -> None:
+        self.puter_auth_in_progress = False
+        self.puter_retry_after_auth = False
+        if self.puter_auth_window is not None:
+            self.puter_auth_window.hide()
+        self._finish_puter_request()
+        self._show_failure(message)
+
+    def _puter_bridge_completed(self, request_id: int, text: str) -> None:
+        if request_id != self.puter_active_request_id:
+            return
+        if self.puter_pending_messages is not None:
+            self.puter_history = self.puter_pending_messages + [{"role": "assistant", "content": text}]
+        self._finish_puter_request()
+        self._append_result(text)
+
+    def _puter_bridge_failed(self, request_id: int, message: str) -> None:
+        if request_id == 0:
+            self.puter_active_request_id = None
+            self.puter_pending_messages = None
+            self.set_progress_state("error")
+            self.set_status("error", "Error")
+            self.append_chat_bubble("error", f"Request failed.\nReason: {message}")
+            self.send_button.setEnabled(True)
+            return
+        if request_id != self.puter_active_request_id:
+            return
+        if self.puter_auth_in_progress:
+            return
+        self._finish_puter_request()
+        self._show_failure(message)
+
+    def _run_puter_agent(
+        self,
+        prompt: str,
+        *,
+        hidden: bool = False,
+        setup_only: bool = False,
+        display_prompt: str | None = None,
+        initial_progress: list[str] | None = None,
+    ) -> None:
+        if self.puter_active_request_id is not None:
+            QMessageBox.information(self, "Busy", "Puter OpenAI is still working on the current request.")
+            return
+
+        self.set_status("busy", "Working")
+        self.send_button.setEnabled(False)
+        if not hidden:
+            self.append_chat_bubble("user", display_prompt if display_prompt is not None else prompt)
+        self.progress.clear()
+        self.set_progress_state("busy")
+        for line in initial_progress or []:
+            self.append_progress(line)
+        self.append_progress(f"Preparing Puter OpenAI ({self.args.model})")
+        QApplication.processEvents()
+
+        try:
+            bridge = self._ensure_puter_bridge()
+        except Exception as exc:
+            self.send_button.setEnabled(True)
+            self.set_progress_state("error")
+            self.set_status("error", "Error")
+            self.append_chat_bubble("error", f"Request failed.\nReason: {exc}")
+            return
+
+        if setup_only:
+            if bridge.is_ready:
+                self._puter_bridge_ready()
+            else:
+                self.append_progress("Waiting for Puter bridge to finish loading")
+            self.send_button.setEnabled(True)
+            return
+
+        self.append_progress(f"Calling Puter OpenAI ({self.args.model})")
+        QApplication.processEvents()
+
+        request_id = self.puter_next_request_id
+        self.puter_next_request_id += 1
+        messages = self.puter_history + [{"role": "user", "content": prompt}]
+        self.puter_pending_messages = messages
+        self.puter_active_request_id = request_id
+        bridge.submit(messages, self.args.model, request_id)
 
     def expand_panel(self) -> None:
         if self.expanded:
@@ -1781,7 +2218,8 @@ class PetWindow(QMainWindow):
             self.set_status("ready", f"Ready: {self.args.provider} / {self.args.model}")
 
     def update_model_default(self, provider: str) -> None:
-        self.model_input.setText(resolve_default_model(provider))
+        self.model_input.setText(_desktop_model_default(provider))
+        self._sync_provider_ui(provider)
 
     def switch_model(self) -> None:
         if self.thread is not None:
@@ -1790,8 +2228,8 @@ class PetWindow(QMainWindow):
 
         provider = self.provider_combo.currentText().strip()
         model = self.model_input.text().strip()
-        if provider not in {"gemini", "ollama"}:
-            QMessageBox.warning(self, "Invalid provider", "Choose gemini or ollama.")
+        if provider not in {"gemini", "ollama", PUTER_PROVIDER}:
+            QMessageBox.warning(self, "Invalid provider", "Choose gemini, ollama, or puter-openai.")
             return
         if not model:
             QMessageBox.warning(self, "Missing model", "Enter a model name before switching.")
@@ -1800,10 +2238,14 @@ class PetWindow(QMainWindow):
         self.args.provider = provider
         self.args.model = model
         self.runtime = None
+        self.puter_history = []
+        self.puter_pending_messages = None
+        self.puter_active_request_id = None
         self.progress.clear()
         self.set_progress_state("busy")
         self.append_progress(f"Switching to {provider} / {model}")
         self.set_status("starting", "Starting")
+        self._sync_provider_ui(provider)
         self.initialize_runtime()
 
     def send_chat(self) -> None:
@@ -1909,6 +2351,9 @@ class PetWindow(QMainWindow):
     def reset_chat(self) -> None:
         if self.runtime is not None:
             self.runtime.reset()
+        self.puter_history = []
+        self.puter_pending_messages = None
+        self.puter_active_request_id = None
         self.output.clear()
         self.progress.clear()
         self.set_progress_state("success")
@@ -1928,6 +2373,15 @@ class PetWindow(QMainWindow):
         initial_progress: list[str] | None = None,
         direct_referenced_emails: list[dict[str, str]] | None = None,
     ) -> None:
+        if self.args.provider == PUTER_PROVIDER and direct_referenced_emails is None:
+            self._run_puter_agent(
+                prompt,
+                hidden=hidden,
+                setup_only=setup_only,
+                display_prompt=display_prompt,
+                initial_progress=initial_progress,
+            )
+            return
         if self.thread is not None:
             QMessageBox.information(self, "Busy", "Email Guardian is still working on the current request.")
             return
@@ -2009,6 +2463,12 @@ class PetWindow(QMainWindow):
             self.mail_thread.wait(timeout_ms)
 
     def _full_shutdown_cleanup(self) -> None:
+        if self.puter_server_process is not None and self.puter_server_process.poll() is None:
+            self.puter_server_process.terminate()
+            try:
+                self.puter_server_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.puter_server_process.kill()
         self._drain_worker_threads(3000)
         terminate_stack_child_pids_from_env()
         terminate_own_subprocesses()
@@ -2058,10 +2518,11 @@ class PetWindow(QMainWindow):
 
 def parse_args() -> argparse.Namespace:
     load_local_env(PROJECT_ROOT)
-    default_provider = resolve_provider()
+    env_provider = (os.getenv("LLM_PROVIDER") or "").strip().lower()
+    default_provider = env_provider if env_provider == PUTER_PROVIDER else resolve_provider()
     parser = argparse.ArgumentParser(description="Run Email Guardian as a desktop pet.")
-    parser.add_argument("--provider", default=default_provider, choices=["ollama", "gemini"])
-    parser.add_argument("--model", default=resolve_default_model(default_provider))
+    parser.add_argument("--provider", default=default_provider, choices=["ollama", "gemini", PUTER_PROVIDER])
+    parser.add_argument("--model", default=_desktop_model_default(default_provider))
     parser.add_argument("--ollama-base-url", default=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"))
     parser.add_argument("--base-url", default=os.getenv("RSPAMD_BASE_URL", "http://127.0.0.1:11333"))
     return parser.parse_args()

@@ -2,7 +2,7 @@
 
 ## 1. Introduction
 
-`email_agent` is a terminal chatbot for email security analysis. It uses Gemini by default, while still supporting local Ollama-hosted `Qwen3` as an optional provider. It exposes local capabilities through an MCP server, scans raw emails with `rspamd`, checks headers for SPF/DKIM/DMARC signals, and can bind a mailbox over IMAP to monitor new emails or scan the latest emails on demand.
+`email_agent` is a terminal chatbot for email security analysis. It uses Gemini by default, while still supporting local Ollama-hosted `Qwen3` as an optional provider. It also supports Puter OpenAI as an additional provider in the same desktop chat UI, using a hidden frontend bridge to Puter's free `puter.js` integration with models such as `gpt-5.4`. It exposes local capabilities through an MCP server, scans raw emails with `rspamd`, checks headers for SPF/DKIM/DMARC signals, and can bind a mailbox over IMAP to monitor new emails or scan the latest emails on demand.
 
 ## 2. Usage Flow
 
@@ -41,12 +41,58 @@ OLLAMA_MODEL="qwen3:latest"
 OLLAMA_BASE_URL="http://127.0.0.1:11434"
 ```
 
+If you want to use Puter as a normal chat provider in the same desktop UI, set:
+
+```bash
+LLM_PROVIDER="puter-openai"
+```
+
+Notes for Puter mode:
+
+- It now uses the same chat box and `Send` flow as Gemini and Ollama.
+- It uses a hidden Qt WebEngine page that loads `https://js.puter.com/v2/` in the background.
+- It requires outbound internet access to Puter's frontend SDK.
+- It does not require an OpenAI API key or a manually copied Puter auth token for the desktop UI path.
+- The default Puter model in this integration is `gpt-5.4`, but you can change it from the desktop UI.
+- Puter's web SDK path is normal chat only in this project. It does not expose
+  the local MCP tool list to the model. Use Gemini/Ollama, a Puter OpenAI token
+  through `PUTER_AUTH_TOKEN`, or an MCP-capable client connected to the MCP URL
+  below when you need real tool calls.
+
 Start the chatbot:
 
 ```bash
 cd ~/Desktop/email_agent
 python chatbot.py
 ```
+
+Run the MCP server directly for an MCP-capable client:
+
+```bash
+cd ~/Desktop/email_agent
+source .venv/bin/activate
+python mcp_server.py
+```
+
+The default transport is `stdio`, which is what the local LangGraph agent uses.
+For clients that connect to an MCP server by URL, start streamable HTTP instead:
+
+```bash
+cd ~/Desktop/email_agent
+./scripts/start_mcp_http.sh
+```
+
+Then configure the client with:
+
+```text
+http://127.0.0.1:8000/mcp
+```
+
+If the client is cloud-hosted, localhost will not work from that client. Expose
+the MCP server through a trusted HTTPS tunnel and configure the public
+`https://.../mcp` URL in the client. This MCP server includes tools that can bind
+mailboxes and read local email data, so do not expose it publicly without access
+controls or a private tunnel.
 
 Start the Ubuntu desktop pet UI:
 
@@ -72,6 +118,7 @@ python chatbot.py --provider gemini --model gemini-2.5-flash
 python chatbot.py --provider ollama --model qwen3:latest
 python desktop_pet.py --provider gemini --model gemini-2.5-flash
 python desktop_pet.py --provider ollama --model qwen3:latest
+python desktop_pet.py --provider puter-openai --model gpt-5.4
 python examples/run_langgraph_gemini_agent.py --provider gemini --model gemini-2.5-flash
 python examples/run_langgraph_gemini_agent.py --provider ollama --model qwen3:latest
 ```
@@ -113,17 +160,27 @@ Run options
 ```bash
 python desktop_pet.py [--provider gemini|ollama] [--model MODEL]
 ```
+- Run MCP over streamable HTTP:
+```bash
+./scripts/start_mcp_http.sh
+```
 - Start full local stack (starts/ensures redis, rspamd, optional Ollama or mock, then runs pet):
 ```bash
 ./scripts/start_full_stack.sh [--provider ollama --model qwen3:latest]
+./scripts/start_full_stack.sh --provider puter-openai --model gpt-5.4
 USE_MOCK_RSPAMD=1 ./scripts/start_full_stack.sh
 ```
 
 Notes
 - Set environment defaults in `.env`: `LLM_PROVIDER`, `GEMINI_MODEL`, `OLLAMA_MODEL`, `RSPAMD_BASE_URL`.
+- `desktop_pet.py --provider puter-openai --model gpt-5.4` now uses the normal desktop chat runtime through a hidden Puter frontend bridge.
+- Puter frontend bridge mode can chat, but it is not an MCP client. For MCP
+  tool calls, use the local LangGraph providers or connect an MCP-capable client
+  to `http://127.0.0.1:8000/mcp`.
 - Ubuntu Qt `xcb` plugin error: `sudo apt-get install -y libxcb-cursor0`.
 - `start_full_stack.sh` will export `EMAIL_AGENT_STACK_CHILD_PIDS` so `desktop_pet.py` can shut down spawned services.
 
 Commands reference
 - Launch UI: `python desktop_pet.py`
 - Launch full stack + UI: `./scripts/start_full_stack.sh`
+- Launch MCP over streamable HTTP: `./scripts/start_mcp_http.sh`

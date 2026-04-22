@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Start local dependencies (Redis, Rspamd or mock, Ollama if configured) then run the desktop pet.
+# Start local dependencies (Redis, Rspamd or mock, Ollama if configured, Puter bridge checks if configured)
+# then run the desktop pet.
 #
 # Usage (from repo root or any directory):
 #   ./scripts/start_full_stack.sh
 #   ./scripts/start_full_stack.sh --provider ollama --model qwen3:latest
+#   ./scripts/start_full_stack.sh --provider puter-openai --model gpt-5.4
 #
 # Environment overrides:
 #   USE_MOCK_RSPAMD=1   Do not use systemd rspamd; run examples/mock_rspamd_server.py on :11333 instead.
@@ -18,9 +20,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+PUTER_PROVIDER="puter-openai"
+PUTER_WEB_PORT="${PUTER_WEB_PORT:-8765}"
+PUTER_BRIDGE_LOG="/tmp/email_agent_puter_bridge.log"
 USE_MOCK_RSPAMD="${USE_MOCK_RSPAMD:-0}"
 SKIP_SYSTEMD="${SKIP_SYSTEMD:-0}"
 START_APP="${START_APP:-pet}"
+CLI_PROVIDER=""
+CLI_MODEL=""
 
 CHILD_PIDS=()
 cleanup() {
@@ -60,6 +67,33 @@ OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
 RSPAMD_BASE_URL="$(read_env_value RSPAMD_BASE_URL)"
 RSPAMD_BASE_URL="${RSPAMD_BASE_URL:-http://127.0.0.1:11333}"
 
+parse_cli_overrides() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider)
+        if [[ $# -ge 2 ]]; then
+          CLI_PROVIDER="$2"
+          shift 2
+          continue
+        fi
+        ;;
+      --model)
+        if [[ $# -ge 2 ]]; then
+          CLI_MODEL="$2"
+          shift 2
+          continue
+        fi
+        ;;
+    esac
+    shift
+  done
+}
+
+parse_cli_overrides "$@"
+if [[ -n "$CLI_PROVIDER" ]]; then
+  LLM_PROVIDER="$CLI_PROVIDER"
+fi
+
 ollama_host_port() {
   # crude parse host:port from OLLAMA_BASE_URL for health checks
   local url="$OLLAMA_BASE_URL"
@@ -98,6 +132,11 @@ wait_tcp() {
   done
   echo "[start_full_stack] ERROR: ${label} did not become ready on ${host}:${port}." >&2
   return 1
+}
+
+python_module_ok() {
+  local module="$1"
+  "$PY" -c "import ${module}" >/dev/null 2>&1
 }
 
 if [[ ! -d "$ROOT/.venv" ]]; then
@@ -165,6 +204,41 @@ if [[ "${LLM_PROVIDER,,}" == "ollama" ]]; then
       exit 1
     fi
     echo "[start_full_stack] Ollama is up (logs: /tmp/email_agent_ollama.log)."
+  fi
+fi
+
+if [[ "${LLM_PROVIDER,,}" == "${PUTER_PROVIDER}" ]]; then
+  echo "[start_full_stack] Puter mode selected."
+  if [[ "${START_APP,,}" == "chatbot" ]]; then
+    echo "[start_full_stack] ERROR: puter-openai currently targets the desktop pet UI, not chatbot.py." >&2
+    exit 1
+  fi
+  if ! python_module_ok fastapi; then
+    echo "[start_full_stack] ERROR: fastapi is missing in .venv." >&2
+    echo "  Run: source \"$ROOT/.venv/bin/activate\" && pip install -r requirements.txt" >&2
+    exit 1
+  fi
+  if ! python_module_ok uvicorn; then
+    echo "[start_full_stack] ERROR: uvicorn is missing in .venv." >&2
+    echo "  Run: source \"$ROOT/.venv/bin/activate\" && pip install -r requirements.txt" >&2
+    exit 1
+  fi
+  if ! "$PY" -c "from PySide6.QtWebEngineCore import QWebEnginePage" >/dev/null 2>&1; then
+    echo "[start_full_stack] ERROR: PySide6 WebEngine is missing in .venv." >&2
+    echo "  Run: source \"$ROOT/.venv/bin/activate\" && pip install -r requirements.txt" >&2
+    exit 1
+  fi
+  if tcp_open 127.0.0.1 "${PUTER_WEB_PORT}"; then
+    echo "[start_full_stack] Puter bridge server already responding at http://127.0.0.1:${PUTER_WEB_PORT}."
+  else
+    echo "[start_full_stack] Starting Puter bridge server on http://127.0.0.1:${PUTER_WEB_PORT} ..."
+    "$PY" -m uvicorn web.server:app --host 127.0.0.1 --port "${PUTER_WEB_PORT}" >"${PUTER_BRIDGE_LOG}" 2>&1 &
+    CHILD_PIDS+=("$!")
+    if ! wait_tcp 127.0.0.1 "${PUTER_WEB_PORT}" "Puter bridge server" 75; then
+      echo "[start_full_stack] ERROR: Puter bridge server did not start (see ${PUTER_BRIDGE_LOG})." >&2
+      exit 1
+    fi
+    echo "[start_full_stack] Puter bridge server is up (logs: ${PUTER_BRIDGE_LOG})."
   fi
 fi
 

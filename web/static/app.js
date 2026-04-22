@@ -1,47 +1,165 @@
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 const SKILL_CLASS = {
-  rspamd_scan_email:           'skill-rspamd',
-  email_header_auth_check:     'skill-header',
-  urgency_check:               'skill-urgency',
-  url_reputation_check:        'skill-url',
-  error_pattern_memory_check:  'skill-memory',
+  rspamd_scan_email: 'skill-rspamd',
+  email_header_auth_check: 'skill-header',
+  urgency_check: 'skill-urgency',
+  url_reputation_check: 'skill-url',
+  error_pattern_memory_check: 'skill-memory',
+  puter_openai_browser: 'skill-memory',
 };
 
 const SKILL_DONE_DOT = {
-  rspamd_scan_email:           'done-purple',
-  email_header_auth_check:     'done-green',
-  urgency_check:               'done-amber',
-  url_reputation_check:        'done-red',
-  error_pattern_memory_check:  'done-slate',
+  rspamd_scan_email: 'done-purple',
+  email_header_auth_check: 'done-green',
+  urgency_check: 'done-amber',
+  url_reputation_check: 'done-red',
+  error_pattern_memory_check: 'done-slate',
+  puter_openai_browser: 'done-purple',
 };
 
 const VERDICT_DISPLAY = {
-  benign:               { label: '✓ BENIGN',    cls: 'benign' },
-  suspicious:           { label: '⚠ SUSPICIOUS', cls: 'suspicious' },
-  phishing_or_spoofing: { label: '⚠ PHISHING',  cls: 'phishing_or_spoofing' },
-  error:                { label: '✕ ERROR',      cls: 'error' },
+  benign: { label: '✓ BENIGN', cls: 'benign' },
+  suspicious: { label: '⚠ SUSPICIOUS', cls: 'suspicious' },
+  phishing_or_spoofing: { label: '⚠ PHISHING', cls: 'phishing_or_spoofing' },
+  error: { label: '✕ ERROR', cls: 'error' },
 };
+
+const PUTER_PROVIDER = 'puter-openai';
+const SERVER_PROVIDER = 'server-agent';
+const PUTER_DEFAULT_MODEL = 'gpt-5.4';
+
+function escHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
 
 function verdictBadgeHtml(verdict) {
   if (!verdict) return '<span class="badge badge-none">—</span>';
   const map = {
-    benign:               'badge badge-benign',
-    suspicious:           'badge badge-suspicious',
+    benign: 'badge badge-benign',
+    suspicious: 'badge badge-suspicious',
     phishing_or_spoofing: 'badge badge-phishing',
-    error:                'badge badge-error',
+    error: 'badge badge-error',
   };
-  const labels = { benign: 'BENIGN', suspicious: 'SUSPICIOUS', phishing_or_spoofing: 'PHISHING', error: 'ERROR' };
+  const labels = {
+    benign: 'BENIGN',
+    suspicious: 'SUSPICIOUS',
+    phishing_or_spoofing: 'PHISHING',
+    error: 'ERROR',
+  };
   const cls = map[verdict] || 'badge badge-none';
   const text = labels[verdict] || verdict.toUpperCase();
   return `<span class="${cls}">${text}</span>`;
+}
+
+function currentAnalyzer() {
+  return document.getElementById('model-provider').value || SERVER_PROVIDER;
+}
+
+function currentModel() {
+  const explicit = document.getElementById('model-name').value.trim();
+  if (explicit) return explicit;
+  return currentAnalyzer() === PUTER_PROVIDER ? PUTER_DEFAULT_MODEL : '';
+}
+
+function storeModelPreferences() {
+  localStorage.setItem('mail_analyzer_provider', currentAnalyzer());
+  localStorage.setItem('mail_analyzer_model', currentModel());
+}
+
+function defaultModelFor(provider) {
+  return provider === PUTER_PROVIDER ? PUTER_DEFAULT_MODEL : '';
+}
+
+function readQueryConfig() {
+  const params = new URLSearchParams(window.location.search);
+  return {
+    provider: params.get('provider') || '',
+    model: params.get('model') || '',
+  };
+}
+
+function initModelControls() {
+  const providerEl = document.getElementById('model-provider');
+  const modelEl = document.getElementById('model-name');
+  const hintEl = document.getElementById('provider-hint');
+  const query = readQueryConfig();
+  const savedProvider = localStorage.getItem('mail_analyzer_provider') || '';
+  const savedModel = localStorage.getItem('mail_analyzer_model') || '';
+  const provider = query.provider || savedProvider || SERVER_PROVIDER;
+  const model = query.model || savedModel || defaultModelFor(provider);
+
+  providerEl.value = provider;
+  modelEl.value = model;
+  syncProviderHint();
+
+  providerEl.addEventListener('change', () => {
+    if (!modelEl.value.trim()) {
+      modelEl.value = defaultModelFor(providerEl.value);
+    }
+    syncProviderHint();
+    storeModelPreferences();
+  });
+
+  modelEl.addEventListener('change', storeModelPreferences);
+  modelEl.addEventListener('blur', storeModelPreferences);
+
+  hintEl.title = 'Puter OpenAI requires internet access and runs in the browser session.';
+}
+
+function syncProviderHint() {
+  const hintEl = document.getElementById('provider-hint');
+  if (currentAnalyzer() === PUTER_PROVIDER) {
+    hintEl.textContent = 'Puter OpenAI runs in-browser and may prompt for sign-in.';
+    if (!document.getElementById('model-name').value.trim()) {
+      document.getElementById('model-name').value = PUTER_DEFAULT_MODEL;
+    }
+    return;
+  }
+  hintEl.textContent = 'Server Agent uses the backend Gemini/Ollama runtime.';
+}
+
+function extractVerdict(text) {
+  const match = text.match(/verdict\s*:\s*(benign|suspicious|phishing_or_spoofing)/i);
+  if (match) return match[1].toLowerCase();
+  const lower = text.toLowerCase();
+  if (lower.includes('phishing') || lower.includes('spoof')) return 'phishing_or_spoofing';
+  if (lower.includes('suspicious')) return 'suspicious';
+  if (lower.includes('benign') || lower.includes('legitimate') || lower.includes('safe')) return 'benign';
+  return 'suspicious';
+}
+
+function buildPuterPrompt(email) {
+  return [
+    'You are an email security analyst.',
+    'Analyze the raw RFC822 email below for phishing, spoofing, fraud, urgency abuse, and malicious links.',
+    'Reply in plain text using exactly this structure:',
+    'Verdict: benign|suspicious|phishing_or_spoofing',
+    'Confidence: low|medium|high',
+    'Summary: one concise paragraph',
+    'Signals:',
+    '- bullet 1',
+    '- bullet 2',
+    '- bullet 3',
+    '',
+    `Subject: ${email.subject || '(no subject)'}`,
+    `From: ${email.from_address || ''}`,
+    '',
+    'Raw email:',
+    email.raw_email || '',
+  ].join('\n');
 }
 
 // ── state ────────────────────────────────────────────────────────────────────
 
 let activeUid = null;
 let activeEventSource = null;
-const skillNodes = {};   // uid → { skillName → {dotEl, cardEl} }
+let activeAnalysisToken = 0;
+const skillNodes = {};
 
 // ── inbox ────────────────────────────────────────────────────────────────────
 
@@ -58,7 +176,7 @@ async function loadEmails() {
     return;
   }
 
-  list.innerHTML = emails.map(e => `
+  list.innerHTML = emails.map((e) => `
     <div class="email-row" data-uid="${e.uid}" onclick="selectEmail(${e.uid}, ${JSON.stringify(e).replace(/"/g, '&quot;')})">
       <div class="row-top">
         <span class="subject ${e.analyzed ? '' : 'unread'}">${escHtml(e.subject)}</span>
@@ -69,14 +187,6 @@ async function loadEmails() {
   `).join('');
 
   updateStatus();
-}
-
-function escHtml(str) {
-  return String(str || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
 }
 
 async function updateStatus() {
@@ -93,52 +203,47 @@ async function updateStatus() {
 
 // ── email selection ──────────────────────────────────────────────────────────
 
-function selectEmail(uid, emailData) {
+function stopActiveAnalysis() {
+  activeAnalysisToken += 1;
   if (activeEventSource) {
     activeEventSource.close();
     activeEventSource = null;
   }
+}
+
+function selectEmail(uid, emailData) {
+  stopActiveAnalysis();
   activeUid = uid;
 
-  // Highlight selected row
-  document.querySelectorAll('.email-row').forEach(r => r.classList.remove('selected'));
+  document.querySelectorAll('.email-row').forEach((r) => r.classList.remove('selected'));
   const row = document.querySelector(`.email-row[data-uid="${uid}"]`);
   if (row) row.classList.add('selected');
 
-  // Show analysis panel
   document.getElementById('analysis-empty').style.display = 'none';
   const content = document.getElementById('analysis-content');
   content.classList.add('visible');
 
-  // Set header
   document.getElementById('email-subject').textContent = emailData.subject || '(no subject)';
-  document.getElementById('email-meta').textContent =
-    `From: ${emailData.from_address || ''}`;
+  document.getElementById('email-meta').textContent = `From: ${emailData.from_address || ''}`;
 
-  // Reset panels
   resetAnalysisPanel();
-
-  // Start streaming
   streamAnalysis(uid);
 }
 
 function resetAnalysisPanel() {
-  // Clear timeline (keep label)
   const timeline = document.getElementById('timeline');
   timeline.innerHTML = '<div class="timeline-section-label">ANALYSIS</div>';
   skillNodes[activeUid] = {};
 
-  // Hide/reset reasoning
   const rb = document.getElementById('reasoning-box');
   rb.textContent = '';
   rb.classList.remove('visible');
+  rb.style.borderLeftColor = '#334155';
 
-  // Hide verdict
   const vb = document.getElementById('verdict-bar');
   vb.className = '';
   vb.style.display = 'none';
 
-  // Hide body
   const bs = document.getElementById('body-section');
   bs.classList.remove('visible');
   document.getElementById('body-content').textContent = '';
@@ -146,9 +251,17 @@ function resetAnalysisPanel() {
   document.getElementById('body-overlay').classList.add('hidden');
 }
 
-// ── SSE streaming ────────────────────────────────────────────────────────────
+// ── analysis dispatch ────────────────────────────────────────────────────────
 
 function streamAnalysis(uid) {
+  if (currentAnalyzer() === PUTER_PROVIDER) {
+    streamPuterAnalysis(uid, activeAnalysisToken);
+    return;
+  }
+  streamServerAnalysis(uid);
+}
+
+function streamServerAnalysis(uid) {
   const es = new EventSource(`/api/stream/${uid}`);
   activeEventSource = es;
 
@@ -169,6 +282,56 @@ function streamAnalysis(uid) {
     es.close();
     activeEventSource = null;
   };
+}
+
+async function streamPuterAnalysis(uid, token) {
+  addSkillNode(uid, 'puter_openai_browser', 'running');
+  showReasoning('Connecting to Puter OpenAI...');
+
+  try {
+    const emailResp = await fetch(`/api/email/${uid}/source`);
+    if (!emailResp.ok) {
+      throw new Error('Unable to load raw email source for browser analysis.');
+    }
+    const email = await emailResp.json();
+    if (token !== activeAnalysisToken) return;
+
+    if (!window.puter || !window.puter.ai || typeof window.puter.ai.chat !== 'function') {
+      throw new Error('Puter SDK did not load. Check network access and reload the analyzer.');
+    }
+
+    const startedAt = Date.now();
+    const prompt = buildPuterPrompt(email);
+    let output = '';
+    const response = await window.puter.ai.chat(prompt, {
+      model: currentModel() || PUTER_DEFAULT_MODEL,
+      stream: true,
+      temperature: 0,
+    });
+
+    for await (const part of response) {
+      if (token !== activeAnalysisToken) return;
+      output += part?.text || '';
+      showReasoning(output.trim() || 'Waiting for model output...');
+    }
+
+    if (token !== activeAnalysisToken) return;
+
+    const verdict = extractVerdict(output);
+    completeSkillNode(
+      uid,
+      'puter_openai_browser',
+      true,
+      `model ${currentModel() || PUTER_DEFAULT_MODEL} · browser analysis`
+    );
+    showVerdict(verdict, Date.now() - startedAt);
+    refreshInboxBadge(uid, verdict);
+    loadEmailBody(uid, verdict);
+  } catch (error) {
+    if (token !== activeAnalysisToken) return;
+    completeSkillNode(uid, 'puter_openai_browser', false, String(error?.message || error));
+    showError(error?.message || String(error));
+  }
 }
 
 function handleEvent(uid, data) {
@@ -201,7 +364,7 @@ function handleEvent(uid, data) {
 
 function addSkillNode(uid, skillName, state) {
   const nodes = skillNodes[uid] || (skillNodes[uid] = {});
-  if (nodes[skillName]) return;  // already added
+  if (nodes[skillName]) return;
 
   const timeline = document.getElementById('timeline');
   const skillCls = SKILL_CLASS[skillName] || 'skill-memory';
@@ -261,7 +424,7 @@ function showReasoning(text) {
   rb.textContent = text;
 }
 
-// ── verdict ───────────────────────────────────────────────────────────────────
+// ── verdict ──────────────────────────────────────────────────────────────────
 
 function showVerdict(verdict, elapsedMs) {
   const vb = document.getElementById('verdict-bar');
@@ -269,8 +432,7 @@ function showVerdict(verdict, elapsedMs) {
   vb.className = `visible ${info.cls}`;
   vb.style.display = 'flex';
   document.getElementById('verdict-label').textContent = info.label;
-  document.getElementById('verdict-meta').textContent =
-    elapsedMs ? `${(elapsedMs / 1000).toFixed(1)}s` : '';
+  document.getElementById('verdict-meta').textContent = elapsedMs ? `${(elapsedMs / 1000).toFixed(1)}s` : '';
 }
 
 function showCachedResult(data) {
@@ -289,7 +451,7 @@ function showError(message) {
   rb.style.borderLeftColor = '#dc2626';
 }
 
-// ── email body ────────────────────────────────────────────────────────────────
+// ── email body ───────────────────────────────────────────────────────────────
 
 async function loadEmailBody(uid, verdict) {
   const resp = await fetch(`/api/email/${uid}/raw`);
@@ -320,16 +482,19 @@ document.getElementById('reveal-btn').addEventListener('click', () => {
   document.getElementById('body-overlay').classList.add('hidden');
 });
 
-// ── inbox badge refresh ───────────────────────────────────────────────────────
+// ── inbox badge refresh ──────────────────────────────────────────────────────
 
 function refreshInboxBadge(uid, verdict) {
   const row = document.querySelector(`.email-row[data-uid="${uid}"]`);
   if (!row) return;
   const badgeEl = row.querySelector('.badge');
-  if (badgeEl) badgeEl.outerHTML = verdictBadgeHtml(verdict);
+  if (badgeEl) {
+    badgeEl.outerHTML = verdictBadgeHtml(verdict);
+  }
   row.querySelector('.subject')?.classList.remove('unread');
 }
 
 // ── init ─────────────────────────────────────────────────────────────────────
 
+initModelControls();
 loadEmails();

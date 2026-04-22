@@ -378,9 +378,6 @@ def _render_recent_scan(messages: list[BaseMessage], start_idx: int) -> str | No
                 "",
             ]
         )
-    tool_list = summarize_invoked_tools(messages, start_idx)
-    if tool_list:
-        lines.extend([f"Tools: {tool_list}"])
     return "\n".join(lines).rstrip()
 
 
@@ -422,41 +419,44 @@ def _render_single_email_analysis(messages: list[BaseMessage], start_idx: int) -
         f"Email: {subject}",
         f"Type: {_friendly_email_type(subject, from_address)}",
         f"Verdict: {decision}",
-        "Evidence:",
-        "- rspamd_scan_email: "
-        + f"risk={rspamd_data.get('risk_level', 'unknown')}, score={rspamd_data.get('score', 'unknown')}, "
-        + f"action={rspamd_data.get('action', 'unknown')}.",
+        "Why this conclusion:",
+        "- The message content and structure were rated "
+        + f"{rspamd_data.get('risk_level', 'unknown')} risk "
+        + f"(score {rspamd_data.get('score', 'unknown')}).",
     ]
     if isinstance(header_data, dict):
-        lines.append(f"- email_header_auth_check: sender/header risk={header_risk}.")
+        lines.append(f"- The sender and authentication headers looked {header_risk} risk.")
     if isinstance(url_data, dict):
         lines.append(
-            "- url_reputation_check: "
-            + f"risk={url_data.get('risk_level', 'unknown')}, "
-            + f"phishing_score={url_data.get('phishing_score', 'unknown')}."
+            "- The links and URL patterns looked "
+            + f"{url_data.get('risk_level', 'unknown')} risk "
+            + f"(phishing score {url_data.get('phishing_score', 'unknown')})."
         )
     if isinstance(urgency_data, dict):
         lines.append(
-            "- urgency_check: "
-            + f"{urgency_data.get('urgency_label', 'unknown')}, "
-            + f"score={urgency_data.get('urgency_score', 'unknown')}."
+            "- The wording was "
+            + f"{urgency_data.get('urgency_label', 'unknown')} "
+            + f"(pressure score {urgency_data.get('urgency_score', 'unknown')})."
         )
     if categories:
-        lines.append(f"- Main signals: {', '.join(str(item) for item in categories[:4])}.")
+        lines.append(f"- The main warning categories were: {', '.join(str(item) for item in categories[:4])}.")
     if symbol_names:
-        lines.append(f"- Technical hits: {', '.join(symbol_names[:4])}.")
-    if decision == "Normal" and float(rspamd_data.get("score") or 0.0) >= 6:
-        lines.append("- Inference: high Rspamd score was treated as bulk-marketing noise because corroborating URL/urgency/header signals did not support Spam or Phishing.")
+        lines.append(f"- The strongest technical signals were: {', '.join(symbol_names[:4])}.")
+    rspamd_score = float(rspamd_data.get("score") or 0.0)
+    if decision == "Normal" and rspamd_score >= 6:
+        if rspamd_score > 10:
+            lines.append("- The scanner score was high, but the additional checks gave a clear benign explanation, so it was not called spam or phishing.")
+        else:
+            lines.append("- The elevated score looked more like bulk-mail noise because links, urgency, or sender checks did not support spam or phishing.")
     if decision == "Normal" and str(rspamd_data.get("action") or "").lower() == "reject" and _header_format_noise(symbol_names):
-        lines.append("- Inference: Rspamd reject was caused by missing or malformed header-format signals, so it was not used alone as a Spam verdict.")
+        lines.append("- The reject-style signal appeared to come from missing or malformed headers, so it was not used alone as a spam verdict.")
 
     note = _pattern_note(summary)
     if note:
-        lines.append(f"- error_pattern_memory_check/list_error_patterns: {note}")
-
+        lines.append(f"- Past-analysis memory: {note}")
     tool_list = summarize_invoked_tools(messages, start_idx)
     if tool_list:
-        lines.extend(["", f"Tools: {tool_list}"])
+        lines.extend(["", f"Tools called: {tool_list}"])
     return "\n".join(lines)
 
 
@@ -606,10 +606,7 @@ def render_chat_response(messages: list[BaseMessage], start_idx: int) -> str:
         if rendered:
             return rendered
 
-    tool_list = summarize_invoked_tools(messages, start_idx)
     body = latest_ai_message(messages).strip()
     lines: list[str] = []
-    if tool_list:
-        lines.extend([_section("Response"), f"Tools: {tool_list}", ""])
     lines.append(body or "No response produced.")
     return "\n".join(lines)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from skills.header_auth.schemas import EmailHeaderAuthCheckInput
 from skills.header_auth.skill import EmailHeaderAuthCheckSkill
@@ -33,6 +35,8 @@ from skills.imap_monitor.skill import (
 )
 from skills.rspamd.schemas import RspamdScanEmailInput
 from skills.rspamd.skill import RspamdScanEmailSkill
+from skills.scam_indicators.schemas import ScamIndicatorCheckInput
+from skills.scam_indicators.skill import ScamIndicatorCheckSkill
 from skills.urgency.schemas import UrgencyCheckInput
 from skills.urgency.skill import UrgencyCheckSkill
 from skills.url_reputation.schemas import UrlReputationInput
@@ -52,13 +56,43 @@ for logger_name in (
 
 DEFAULT_BASE_URL = os.getenv("RSPAMD_BASE_URL", "http://127.0.0.1:11333")
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _env_csv(name: str) -> list[str]:
+    return [part.strip() for part in os.getenv(name, "").split(",") if part.strip()]
+
+
 mcp = FastMCP(
     name="rspamd-email-skill",
+    host=os.getenv("MCP_HOST", "127.0.0.1"),
+    port=_env_int("MCP_PORT", 8000),
+    sse_path=os.getenv("MCP_SSE_PATH", "/sse"),
+    message_path=os.getenv("MCP_MESSAGE_PATH", "/messages/"),
+    streamable_http_path=os.getenv("MCP_STREAMABLE_HTTP_PATH", "/mcp"),
+    stateless_http=_env_bool("MCP_STATELESS_HTTP", False),
     instructions=(
         "Use rspamd_scan_email to scan RFC822 raw emails with rspamd, and "
         "email_header_auth_check to quickly triage header authentication signals. "
         "Use urgency_check to score the urgency/pressure level of an email using a trained classifier. "
         "Use url_reputation_check to score URL/content phishing risk using a trained GradientBoosting model. "
+        "Use scam_indicator_check to detect obvious scam indicators like gift-card or crypto payment demands, "
+        "extortion threats, lookalike domains, and suspicious reply-to addresses. "
         "Use error_pattern_memory_check to consult known dataset-derived misclassification patterns before finalizing a verdict, "
         "and list_error_patterns to inspect those stored patterns. "
         "Use list_bound_imap_mailboxes to discover already saved mailbox bindings before asking the user "
@@ -370,6 +404,28 @@ def urgency_check(
 
 
 @mcp.tool(
+    name="scam_indicator_check",
+    description=(
+        "Detect obvious human-readable scam indicators in an email, including gift-card or crypto payment demands, "
+        "extortion threats, lookalike brand domains, suspicious payment/recovery links, and free-mail reply addresses "
+        "for messages claiming to be from official organizations."
+    ),
+)
+def scam_indicator_check(
+    raw_email: str = "",
+    subject: str = "",
+    from_address: str = "",
+) -> dict[str, Any]:
+    payload = ScamIndicatorCheckInput(
+        raw_email=raw_email,
+        subject=subject,
+        from_address=from_address,
+    )
+    skill = ScamIndicatorCheckSkill()
+    return skill.run(payload).model_dump()
+
+
+@mcp.tool(
     name="url_reputation_check",
     description=(
         "Score URL/content phishing risk using a GradientBoosting classifier trained on 355k emails. "
@@ -387,8 +443,92 @@ def url_reputation_check(
     return skill.run(payload).model_dump()
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the Email Guardian MCP server.")
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "sse", "streamable-http"),
+        default=os.getenv("MCP_TRANSPORT", "stdio"),
+        help=(
+            "MCP transport to serve. Use stdio for local agent adapters, "
+            "or streamable-http/sse for MCP clients that connect by URL."
+        ),
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("MCP_HOST", "127.0.0.1"),
+        help="HTTP host for sse/streamable-http transports.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=_env_int("MCP_PORT", 8000),
+        help="HTTP port for sse/streamable-http transports.",
+    )
+    parser.add_argument(
+        "--path",
+        default=os.getenv("MCP_STREAMABLE_HTTP_PATH", "/mcp"),
+        help="Streamable HTTP endpoint path.",
+    )
+    parser.add_argument(
+        "--sse-path",
+        default=os.getenv("MCP_SSE_PATH", "/sse"),
+        help="SSE endpoint path.",
+    )
+    parser.add_argument(
+        "--message-path",
+        default=os.getenv("MCP_MESSAGE_PATH", "/messages/"),
+        help="SSE message endpoint path.",
+    )
+    parser.add_argument(
+        "--stateless-http",
+        action="store_true",
+        default=_env_bool("MCP_STATELESS_HTTP", False),
+        help="Run streamable HTTP without server-side session state.",
+    )
+    parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=_env_csv("MCP_ALLOWED_HOSTS"),
+        help=(
+            "Allowed HTTP Host value for DNS rebinding protection. Repeat for "
+            "multiple public tunnel hostnames."
+        ),
+    )
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=_env_csv("MCP_ALLOWED_ORIGINS"),
+        help="Allowed Origin value for DNS rebinding protection. Repeat for multiple origins.",
+    )
+    parser.add_argument(
+        "--disable-dns-rebinding-protection",
+        action="store_true",
+        default=_env_bool("MCP_DISABLE_DNS_REBINDING_PROTECTION", False),
+        help="Disable FastMCP HTTP DNS rebinding checks. Only use on trusted networks.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    mcp.run(transport="stdio")
+    args = _parse_args()
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+    mcp.settings.streamable_http_path = args.path
+    mcp.settings.sse_path = args.sse_path
+    mcp.settings.message_path = args.message_path
+    mcp.settings.stateless_http = args.stateless_http
+    if args.disable_dns_rebinding_protection:
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        )
+    elif args.allowed_host or args.allowed_origin:
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=args.allowed_host,
+            allowed_origins=args.allowed_origin,
+        )
+    mcp.run(transport=args.transport)
 
 
 if __name__ == "__main__":
