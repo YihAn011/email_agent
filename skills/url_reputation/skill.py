@@ -15,6 +15,32 @@ _cache: dict = {}
 
 URL_RE = re.compile(r'https?://[^\s<>"\']+')
 IP_RE = re.compile(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}')
+MARKETING_FOOTER_MARKERS = (
+    "unsubscribe",
+    "list-unsubscribe",
+    "privacy",
+    "view online",
+    "manage preferences",
+    "download the",
+    "download our app",
+    "app store",
+)
+ACCOUNT_SECURITY_MARKERS = (
+    "verify",
+    "verification",
+    "password",
+    "login",
+    "log in",
+    "sign in",
+    "sign-in",
+    "security alert",
+    "account suspended",
+    "confirm your identity",
+    "gift card",
+    "cryptocurrency",
+    "bitcoin",
+    "wallet",
+)
 
 
 def _load() -> tuple:
@@ -26,6 +52,51 @@ def _load() -> tuple:
     meta = pickle.load(open(MODEL_DIR / "meta.pkl", "rb"))
     _cache.update({"clf": clf, "meta": meta})
     return clf, meta
+
+
+def _root_domain(url: str) -> str:
+    host = (urlparse(url).netloc or "").split("@")[-1].split(":")[0].strip(".").lower()
+    if not host:
+        return ""
+    if IP_RE.fullmatch(host):
+        return host
+    parts = [part for part in host.split(".") if part]
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return host
+
+
+def _marketing_template_markers(text: str) -> int:
+    lowered = text.lower()
+    return sum(1 for marker in MARKETING_FOOTER_MARKERS if marker in lowered)
+
+
+def _has_account_security_context(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in ACCOUNT_SECURITY_MARKERS)
+
+
+def _looks_like_legit_marketing_template(payload: UrlReputationInput, urls: list[str]) -> bool:
+    text = payload.email_text or ""
+    subject = payload.subject or ""
+    lowered = f"{subject}\n{text}".lower()
+    footer_markers = _marketing_template_markers(lowered)
+    if footer_markers < 2:
+        return False
+    if _has_account_security_context(lowered):
+        return False
+
+    roots = {_root_domain(url) for url in urls if _root_domain(url)}
+    if not roots or len(roots) > 4:
+        return False
+    if any(IP_RE.search(urlparse(url).netloc or "") for url in urls):
+        return False
+
+    promotional_tone = any(
+        marker in lowered
+        for marker in ("save ", "deal", "offer", "book now", "shop deals", "download the app", "overview")
+    )
+    return promotional_tone or payload.num_urls >= 3 or len(urls) >= 3
 
 
 def _extract_features(payload: UrlReputationInput) -> tuple[dict, list[str]]:
@@ -82,6 +153,12 @@ class UrlReputationSkill(BaseSkill[UrlReputationInput, UrlReputationResult]):
                 feature_names = meta["features"]
                 X = [[features[f] for f in feature_names]]
                 score = float(clf.predict_proba(X)[0][1])
+
+            dampened_for_marketing = False
+            if _looks_like_legit_marketing_template(payload, urls):
+                score = min(score, max(0.2, threshold - 0.06))
+                dampened_for_marketing = True
+
             is_suspicious = score >= threshold
 
             if score >= 0.7:
@@ -96,6 +173,8 @@ class UrlReputationSkill(BaseSkill[UrlReputationInput, UrlReputationResult]):
                 f"Extracted {len(urls)} URL(s). "
                 f"Risk level: {risk_level}."
             )
+            if dampened_for_marketing:
+                summary += " Score was dampened because the message strongly resembles a standard marketing template."
             if clf is None or meta is None:
                 summary = (
                     "Fallback heuristic URL reputation scoring was used because the trained model files were not found. "

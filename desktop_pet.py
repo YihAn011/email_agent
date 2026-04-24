@@ -8,6 +8,7 @@ import json
 import os
 import random
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -61,13 +62,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
-from examples.model_factory import resolve_default_model, resolve_provider
+from examples.model_factory import build_chat_model, resolve_default_model, resolve_provider
 from harness.prompts import DEFAULT_EMAIL, HELP_TEXT, build_analysis_prompt
 from harness.runtime import (
     EmailAgentRuntime,
     is_quota_error,
     latest_ai_message,
+    render_content,
     summarize_invoked_tools,
     summarize_tool_messages,
 )
@@ -111,6 +114,12 @@ PANEL_SIZE = QSize(1180, 680)
 DRAG_HOLD_MS = 250
 EMAIL_PAGE_SIZE = 10
 PUTER_PROVIDER = "puter-openai"
+TOKENROUTER_PROVIDER = "tokenrouter"
+TOKENROUTER_MODELS = [
+    "openai/gpt-5-mini",
+    "openai/gpt-5.4",
+    "anthropic/claude-haiku-4.5",
+]
 PUTER_WEB_PORT = 8765
 PUTER_BRIDGE_LOG = "/tmp/email_agent_puter_bridge.log"
 DEVELOPER_RUNS_DIR = PROJECT_ROOT / "dataset" / "reports" / "developer_runs"
@@ -156,7 +165,113 @@ def _sigterm_pid(pid: int) -> None:
 def _desktop_model_default(provider: str) -> str:
     if provider == PUTER_PROVIDER:
         return "gpt-5.4"
+    if provider == TOKENROUTER_PROVIDER:
+        return TOKENROUTER_MODELS[0]
     return resolve_default_model(provider)
+
+
+def _format_dev_timestamp(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return time.strftime("%H:%M:%S", time.localtime(value))
+
+
+def _format_dev_duration(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "n/a"
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _model_selector_text(widget: Any) -> str:
+    if isinstance(widget, QComboBox):
+        return widget.currentText().strip()
+    if isinstance(widget, QLineEdit):
+        return widget.text().strip()
+    return str(widget).strip()
+
+
+def _set_model_selector_text(widget: Any, value: str) -> None:
+    if isinstance(widget, QComboBox):
+        if widget.isEditable():
+            widget.setEditText(value)
+        else:
+            idx = widget.findText(value)
+            if idx >= 0:
+                widget.setCurrentIndex(idx)
+            elif widget.count():
+                widget.setCurrentIndex(0)
+        return
+    if isinstance(widget, QLineEdit):
+        widget.setText(value)
+
+
+def _developer_dashboard_model_label(provider: str, model: str) -> str:
+    provider = (provider or "").strip().lower()
+    model = (model or "").strip()
+    model_key = model.lower()
+    if provider == "ollama" and model_key.startswith("qwen3"):
+        return "Qwen3 Local"
+    if model_key == "openai/gpt-5-mini":
+        return "GPT-5 Mini"
+    if model_key == "openai/gpt-5.4":
+        return "GPT-5.4"
+    if model_key == "anthropic/claude-haiku-4.5":
+        return "Claude Haiku 4.5"
+    if "/" in model:
+        return model.split("/", 1)[1]
+    return model or provider or "Unknown"
+
+
+def _developer_export_dashboard_image(runs: list[dict[str, Any]], out_path: Path) -> Path:
+    if len(runs) < 2:
+        raise ValueError("At least 2 finished tests are required to generate a dashboard.")
+    exporter = PROJECT_ROOT / "tools" / "export_developer_dashboard.py"
+    if not exporter.exists():
+        raise FileNotFoundError(f"Dashboard exporter script not found: {exporter}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload_path = DEVELOPER_RUNS_DIR / "_dashboard_export_payload.json"
+    payload_path.write_text(json.dumps(runs, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/python3", str(exporter), "--input", str(payload_path), "--output", str(out_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+    finally:
+        try:
+            payload_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        message = stderr or stdout or "Unknown export error."
+        raise RuntimeError(message)
+    return out_path
+
+
+def _configure_model_selector(widget: QComboBox, provider: str, selected: str = "") -> None:
+    current = selected.strip() or _model_selector_text(widget) or _desktop_model_default(provider)
+    widget.blockSignals(True)
+    widget.clear()
+    if provider == TOKENROUTER_PROVIDER:
+        widget.setEditable(False)
+        for model_name in TOKENROUTER_MODELS:
+            widget.addItem(model_name)
+        idx = widget.findText(current)
+        widget.setCurrentIndex(idx if idx >= 0 else 0)
+    else:
+        widget.setEditable(True)
+        widget.addItem(current)
+        widget.setCurrentText(current)
+    widget.blockSignals(False)
 
 
 def _port_open(host: str, port: int) -> bool:
@@ -243,6 +358,33 @@ class PuterBridgeController(QObject):
         script = f"window.__puterBridgeSubmit({json.dumps(payload)});"
         self._page.runJavaScript(script)
 
+    def sign_out(self) -> None:
+        self.ensure_loaded()
+        if self._page is None:
+            return
+        script = """
+        (async () => {
+          try {
+            if (window.puter && window.puter.auth && typeof window.puter.auth.signOut === "function") {
+              await window.puter.auth.signOut();
+            }
+          } catch (_error) {}
+          try { window.localStorage.clear(); } catch (_error) {}
+          try { window.sessionStorage.clear(); } catch (_error) {}
+          if (window.indexedDB && typeof window.indexedDB.databases === "function") {
+            try {
+              const databases = await window.indexedDB.databases();
+              for (const db of databases) {
+                if (db && db.name) {
+                  window.indexedDB.deleteDatabase(db.name);
+                }
+              }
+            } catch (_error) {}
+          }
+        })();
+        """
+        self._page.runJavaScript(script)
+
     def _handle_console_message(self, message: str) -> None:
         prefix = "__PUTER_EVENT__"
         if not message.startswith(prefix):
@@ -272,10 +414,10 @@ class PuterBridgeController(QObject):
             self.completed.emit(request_id, str(payload.get("text", "")))
             return
         if event_type == "auth_required":
-            self.auth_required.emit(request_id, str(payload.get("message", "Puter authentication required")))
+            self.auth_required.emit(request_id, str(payload.get("message", "ChatGPT login required")))
             return
         if event_type == "error":
-            self.failed.emit(request_id, str(payload.get("message", "Unknown Puter error")))
+            self.failed.emit(request_id, str(payload.get("message", "Unknown ChatGPT error")))
 
 
 def terminate_stack_child_pids_from_env() -> None:
@@ -712,12 +854,13 @@ def _developer_routed_skills(
 
 
 def _developer_dataset_paths() -> list[Path]:
-    candidates: list[Path] = []
-    for base in (PROJECT_ROOT / "database", PROJECT_ROOT / "dataset" / "processed", PROJECT_ROOT / "dataset" / "raw"):
-        if not base.exists():
-            continue
-        candidates.extend(sorted(base.glob("*.csv")))
-    return candidates
+    processed = PROJECT_ROOT / "dataset" / "processed"
+    preferred = [
+        processed / "spam_binary_test_4source_all.csv",
+        processed / "spam_binary_test_modern_sources.csv",
+        processed / "spam_binary_test_all_sources_latest.csv",
+    ]
+    return [path for path in preferred if path.exists()]
 
 
 def _developer_dataset_summary(path: Path) -> dict[str, Any]:
@@ -735,14 +878,12 @@ def _developer_dataset_summary(path: Path) -> dict[str, Any]:
                 labels.add(str(row["normalized_label"]))
             elif row.get("binary_label") not in (None, ""):
                 labels.add(str(row["binary_label"]))
-            if row_count >= 5000 and sources and labels:
-                # Keep UI refresh responsive; exact row count is not needed for setup.
-                break
+            continue
     return {
         "name": path.name,
         "path": str(path),
         "row_count": row_count,
-        "row_count_is_sampled": row_count >= 5000,
+        "row_count_is_sampled": False,
         "sources": sorted(sources),
         "labels": sorted(labels),
         "fields": fields,
@@ -755,6 +896,16 @@ def _developer_preset_dataset(summary: dict[str, Any], *, name: str, preset_sour
     item["preset_sources"] = list(preset_sources)
     item["source_filter_mode"] = "preset_only"
     return item
+
+
+def _developer_slot_run_dir(slot_idx: int) -> Path:
+    return DEVELOPER_RUNS_DIR / f"test{slot_idx + 1}"
+
+
+def _developer_prepare_run_dir(run_dir: Path, *, overwrite: bool) -> None:
+    if overwrite and run_dir.exists():
+        shutil.rmtree(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _developer_load_rows(
@@ -816,17 +967,11 @@ def _developer_actual_binary(row: dict[str, str]) -> int | None:
     return None
 
 
-def _developer_metric_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+def _developer_metric_bucket(records: list[dict[str, Any]], prediction_key: str) -> dict[str, Any]:
     counts = {"tp": 0, "tn": 0, "fp": 0, "fn": 0, "invalid": 0}
-    llm_success = 0
-    llm_errors = 0
     for record in records:
         actual = record.get("actual_binary")
-        pred = record.get("predicted_binary")
-        if bool(record.get("llm_review_used")):
-            llm_success += 1
-        if str(record.get("llm_review_error") or "").strip():
-            llm_errors += 1
+        pred = record.get(prediction_key)
         if actual not in {0, 1} or pred not in {0, 1}:
             counts["invalid"] += 1
         elif actual == 1 and pred == 1:
@@ -851,11 +996,82 @@ def _developer_metric_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "precision": counts["tp"] / predicted_positive if predicted_positive else None,
         "f1": (2 * counts["tp"] / (2 * counts["tp"] + counts["fp"] + counts["fn"])) if (2 * counts["tp"] + counts["fp"] + counts["fn"]) else None,
         "fnr": counts["fn"] / positives if positives else None,
-        "llm_success": llm_success,
-        "llm_errors": llm_errors,
-        "llm_attempts": llm_success + llm_errors,
     }
 
+
+def _developer_metric_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    final_metrics = _developer_metric_bucket(records, "predicted_binary")
+    baseline_metrics = _developer_metric_bucket(records, "baseline_predicted_binary")
+    llm_used = 0
+    llm_applied = 0
+    llm_errors = 0
+    ham_to_positive = 0
+    ham_fp_rescued = 0
+    positive_fn_rescued = 0
+    positive_to_negative = 0
+    spam_to_phishing = 0
+    phishing_to_spam = 0
+    source_groups: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        source = str(record.get("source") or "unknown")
+        source_groups.setdefault(source, []).append(record)
+        if bool(record.get("llm_review_used")):
+            llm_used += 1
+        if bool(record.get("llm_review_applied")):
+            llm_applied += 1
+        if str(record.get("llm_review_error") or "").strip():
+            llm_errors += 1
+        actual = record.get("actual_binary")
+        baseline_pred = record.get("baseline_predicted_binary")
+        final_pred = record.get("predicted_binary")
+        baseline_verdict = str(record.get("baseline_verdict") or "")
+        final_verdict = str(record.get("predicted_verdict") or "")
+        if actual == 0 and baseline_pred == 0 and final_pred == 1:
+            ham_to_positive += 1
+        if actual == 0 and baseline_pred == 1 and final_pred == 0:
+            ham_fp_rescued += 1
+        if actual == 1 and baseline_pred == 0 and final_pred == 1:
+            positive_fn_rescued += 1
+        if actual == 1 and baseline_pred == 1 and final_pred == 0:
+            positive_to_negative += 1
+        if baseline_verdict == "Spam" and final_verdict == "Phishing":
+            spam_to_phishing += 1
+        if baseline_verdict == "Phishing" and final_verdict == "Spam":
+            phishing_to_spam += 1
+    source_metrics: dict[str, Any] = {}
+    for source, source_records in sorted(source_groups.items()):
+        source_metrics[source] = {
+            **_developer_metric_bucket(source_records, "predicted_binary"),
+            "baseline": _developer_metric_bucket(source_records, "baseline_predicted_binary"),
+            "rows": len(source_records),
+        }
+    return {
+        **final_metrics,
+        "baseline": baseline_metrics,
+        "delta_fpr": (
+            final_metrics.get("fpr") - baseline_metrics.get("fpr")
+            if final_metrics.get("fpr") is not None and baseline_metrics.get("fpr") is not None
+            else None
+        ),
+        "delta_recall": (
+            final_metrics.get("recall") - baseline_metrics.get("recall")
+            if final_metrics.get("recall") is not None and baseline_metrics.get("recall") is not None
+            else None
+        ),
+        "llm_success": llm_used,
+        "llm_used": llm_used,
+        "llm_applied": llm_applied,
+        "llm_errors": llm_errors,
+        "llm_attempts": llm_used + llm_errors,
+        "llm_changed": ham_to_positive + ham_fp_rescued + positive_fn_rescued + positive_to_negative + spam_to_phishing + phishing_to_spam,
+        "llm_ham_to_positive": ham_to_positive,
+        "llm_ham_fp_rescued": ham_fp_rescued,
+        "llm_positive_fn_rescued": positive_fn_rescued,
+        "llm_positive_to_negative": positive_to_negative,
+        "llm_spam_to_phishing": spam_to_phishing,
+        "llm_phishing_to_spam": phishing_to_spam,
+        "source_metrics": source_metrics,
+    }
 
 def _developer_format_metric(value: Any) -> str:
     if value is None:
@@ -941,6 +1157,9 @@ def _developer_parse_llm_verdict(text: str) -> tuple[str | None, str]:
             return verdict, rationale
     except Exception:
         pass
+    verdict_match = re.search(r"verdict\s*:\s*(normal|spam|phishing)\b", cleaned, flags=re.IGNORECASE)
+    if verdict_match:
+        return verdict_match.group(1).title(), rationale
     lowered = cleaned.lower()
     if "phishing" in lowered:
         return "Phishing", rationale
@@ -951,29 +1170,457 @@ def _developer_parse_llm_verdict(text: str) -> tuple[str | None, str]:
     return None, rationale
 
 
+def _content_supports_spam_override(
+    content_data: dict[str, Any],
+    *,
+    rspamd_data: dict[str, Any] | None = None,
+    campaign_data: dict[str, Any] | None = None,
+    subject: str = "",
+    from_address: str = "",
+    email_text: str = "",
+) -> bool:
+    score = float(content_data.get("malicious_score") or 0.0)
+    threshold = float(content_data.get("threshold") or 0.0)
+    margin = score - threshold
+    content_risk = str(content_data.get("risk_level") or "").lower()
+    rspamd_score = float((rspamd_data or {}).get("score") or 0.0)
+    rspamd_risk = str((rspamd_data or {}).get("risk_level") or "").lower()
+    campaign_matched = bool((campaign_data or {}).get("matched"))
+    lowered = f"{subject}\n{from_address}\n{email_text}".lower()
+    marketing_markers = sum(
+        1
+        for token in (
+            "unsubscribe",
+            "list-unsubscribe",
+            "privacy",
+            "view online",
+            "manage preferences",
+            "download the app",
+            "book now",
+            "shop deals",
+            "save ",
+            "offer",
+            "sale",
+            "overview",
+            "newsletter",
+        )
+        if token in lowered
+    )
+    account_security_markers = any(
+        token in lowered
+        for token in (
+            "verify",
+            "verification",
+            "password",
+            "login",
+            "log in",
+            "sign in",
+            "sign-in",
+            "security alert",
+            "confirm your identity",
+            "account suspended",
+            "gift card",
+            "bitcoin",
+            "cryptocurrency",
+            "wallet",
+        )
+    )
+    legit_marketing_pattern = marketing_markers >= 2 and not account_security_markers
+    if legit_marketing_pattern and not campaign_matched and rspamd_score < 8.0 and rspamd_risk != "high":
+        return False
+    if campaign_matched or rspamd_score >= 8.0 or rspamd_risk == "high":
+        return True
+    if content_risk == "high" and margin >= 0.2:
+        return True
+    if margin >= 0.25 and rspamd_score >= 6.5:
+        return True
+    return False
+
+
+def _looks_like_legit_marketing_email(
+    *,
+    rspamd_data: dict[str, Any] | None = None,
+    content_data: dict[str, Any] | None = None,
+    header_data: dict[str, Any] | None = None,
+    url_data: dict[str, Any] | None = None,
+    urgency_data: dict[str, Any] | None = None,
+    scam_data: dict[str, Any] | None = None,
+    campaign_data: dict[str, Any] | None = None,
+    subject: str = "",
+    from_address: str = "",
+    email_text: str = "",
+) -> bool:
+    lowered = f"{subject}\n{from_address}\n{email_text}".lower()
+    marketing_markers = sum(
+        1
+        for token in (
+            "unsubscribe",
+            "list-unsubscribe",
+            "privacy",
+            "view online",
+            "manage preferences",
+            "download the app",
+            "book now",
+            "shop deals",
+            "save ",
+            "offer",
+            "sale",
+            "deal",
+            "deals",
+            "travel",
+            "overview",
+            "newsletter",
+            "performance",
+            "future of",
+        )
+        if token in lowered
+    )
+    account_security_markers = any(
+        token in lowered
+        for token in (
+            "verify",
+            "verification",
+            "password",
+            "login",
+            "log in",
+            "sign in",
+            "sign-in",
+            "security alert",
+            "confirm your identity",
+            "account suspended",
+            "gift card",
+            "bitcoin",
+            "cryptocurrency",
+            "wallet",
+            "wire transfer",
+        )
+    )
+    categories = {str(item).lower() for item in ((rspamd_data or {}).get("categories") or [])}
+    rspamd_score = float((rspamd_data or {}).get("score") or 0.0)
+    header_risk = str((header_data or {}).get("risk_level") or "").lower()
+    url_risk = str((url_data or {}).get("risk_level") or "").lower()
+    urgency_risk = str((urgency_data or {}).get("risk_contribution") or "").lower()
+    content_score = float((content_data or {}).get("malicious_score") or 0.0)
+    content_threshold = float((content_data or {}).get("threshold") or 0.0)
+    scam_matched = bool((scam_data or {}).get("matched"))
+    campaign_matched = bool((campaign_data or {}).get("matched"))
+    has_phish_signal = bool({"phishing", "spoofing", "suspicious_links"} & categories)
+    has_spam_signal = bool("spam" in categories or "reputation_issue" in categories)
+    content_margin = content_score - content_threshold
+
+    if marketing_markers < 2 or account_security_markers:
+        return False
+    if scam_matched or campaign_matched or has_phish_signal:
+        return False
+    if header_risk not in {"", "low", "unknown", "n/a"}:
+        return False
+    if url_risk not in {"", "low", "unknown"}:
+        return False
+    if rspamd_score >= 10.5:
+        return False
+    if has_spam_signal and rspamd_score >= 9.5:
+        return False
+    if content_margin >= 0.35:
+        return False
+    if urgency_risk == "high" and marketing_markers < 3:
+        return False
+    return True
+
+
+def _developer_verdict_rank(verdict: str) -> int:
+    return {"Normal": 0, "Spam": 1, "Phishing": 2}.get(str(verdict or "").title(), -1)
+
+
+def _developer_llm_signal_snapshot(
+    *,
+    decision: str,
+    rspamd_data: dict[str, Any],
+    content_data: dict[str, Any],
+    header_data: dict[str, Any],
+    url_data: dict[str, Any],
+    urgency_data: dict[str, Any],
+    scam_data: dict[str, Any],
+    campaign_data: dict[str, Any],
+    subject: str,
+    from_address: str,
+    email_text: str,
+) -> dict[str, Any]:
+    lowered = f"{subject} {from_address} {email_text}".lower()
+    categories = {str(item).lower() for item in (rspamd_data.get("categories") or [])}
+    symbols = {
+        str(item.get("name") or "").lower()
+        for item in (rspamd_data.get("symbols") or [])
+        if isinstance(item, dict)
+    }
+    rspamd_score = float(rspamd_data.get("score") or 0.0)
+    content_score = float(content_data.get("malicious_score") or 0.0)
+    threshold = float(content_data.get("threshold") or 0.5)
+    content_margin = content_score - threshold
+    content_malicious = bool(content_data.get("is_malicious"))
+    header_risk = str(header_data.get("risk_level") or "").lower()
+    url_risk = str(url_data.get("risk_level") or "").lower()
+    url_suspicious = bool(url_data.get("is_suspicious"))
+    urgency_risk = str(urgency_data.get("risk_contribution") or "").lower()
+    urgent = bool(urgency_data.get("is_urgent"))
+    scam_matched = bool(scam_data.get("matched"))
+    campaign_matched = bool(campaign_data.get("matched"))
+    has_phish_signal = bool({"phishing", "spoofing", "suspicious_links"} & categories)
+    has_spam_signal = bool("spam" in categories or any("bayes" in item for item in symbols) or "reputation_issue" in categories)
+    account_context = any(
+        token in lowered
+        for token in (
+            "account",
+            "verify",
+            "verification",
+            "password",
+            "login",
+            "log in",
+            "sign in",
+            "security",
+            "mailbox",
+            "help desk",
+            "invoice",
+            "payment",
+            "statement",
+            "bank",
+        )
+    )
+    branded_marketing = any(
+        token in lowered
+        for token in (
+            "unsubscribe",
+            "newsletter",
+            "flash sale",
+            "special offer",
+            "limited time offer",
+            "promotion",
+            "promo",
+            "deal",
+            "shopify",
+            "marketing",
+        )
+    )
+    routine_business = any(
+        token in lowered
+        for token in (
+            "receipt",
+            "order",
+            "invoice",
+            "statement",
+            "shipment",
+            "delivery",
+            "meeting",
+            "calendar",
+            "maintenance",
+            "notice",
+            "announcement",
+        )
+    )
+    phish_corroboration = sum(
+        1
+        for condition in (
+            header_risk in {"medium", "high"},
+            url_risk in {"medium", "high"} or url_suspicious,
+            scam_matched,
+            urgency_risk in {"medium", "high"} or urgent,
+            has_phish_signal,
+            content_malicious and account_context,
+        )
+        if condition
+    )
+    benign_corroboration = sum(
+        1
+        for condition in (
+            header_risk in {"", "low", "unknown", "n/a"},
+            url_risk in {"", "low", "unknown"} and not url_suspicious,
+            urgency_risk in {"", "low", "unknown"} and not urgent,
+            not scam_matched,
+            not campaign_matched,
+            (not content_malicious) or content_margin <= 0.12,
+            branded_marketing or routine_business,
+        )
+        if condition
+    )
+    locked_high_risk = bool(
+        (header_risk == "high" and (url_suspicious or scam_matched))
+        or (account_context and phish_corroboration >= 4 and rspamd_score >= 10.0)
+    )
+    strong_positive_support = sum(
+        1
+        for condition in (
+            header_risk in {"medium", "high"},
+            url_risk in {"medium", "high"} or url_suspicious,
+            scam_matched,
+            has_phish_signal,
+            campaign_matched and has_spam_signal,
+        )
+        if condition
+    )
+    near_threshold = content_margin >= -0.02
+    return {
+        "decision": decision,
+        "rspamd_score": rspamd_score,
+        "content_score": content_score,
+        "content_threshold": threshold,
+        "content_margin": round(content_margin, 4),
+        "content_malicious": content_malicious,
+        "near_threshold": near_threshold,
+        "header_risk": header_risk,
+        "url_risk": url_risk,
+        "url_suspicious": url_suspicious,
+        "urgency_risk": urgency_risk,
+        "urgent": urgent,
+        "scam_matched": scam_matched,
+        "campaign_matched": campaign_matched,
+        "has_phish_signal": has_phish_signal,
+        "has_spam_signal": has_spam_signal,
+        "strong_positive_support": strong_positive_support,
+        "account_context": account_context,
+        "branded_marketing": branded_marketing,
+        "routine_business": routine_business,
+        "phish_corroboration": phish_corroboration,
+        "benign_corroboration": benign_corroboration,
+        "locked_high_risk": locked_high_risk,
+    }
+
+
+def _developer_llm_review_plan(
+    *,
+    decision: str,
+    rspamd_data: dict[str, Any],
+    content_data: dict[str, Any],
+    header_data: dict[str, Any],
+    url_data: dict[str, Any],
+    urgency_data: dict[str, Any],
+    scam_data: dict[str, Any],
+    campaign_data: dict[str, Any],
+    subject: str,
+    from_address: str,
+    email_text: str,
+    gray_reasons: list[str],
+    allow_positive_downgrade: bool = True,
+    allow_positive_refine: bool = True,
+    allow_normal_upgrade: bool = False,
+) -> dict[str, Any]:
+    snapshot = _developer_llm_signal_snapshot(
+        decision=decision,
+        rspamd_data=rspamd_data,
+        content_data=content_data,
+        header_data=header_data,
+        url_data=url_data,
+        urgency_data=urgency_data,
+        scam_data=scam_data,
+        campaign_data=campaign_data,
+        subject=subject,
+        from_address=from_address,
+        email_text=email_text,
+    )
+    review_mode = ""
+    hard_upgrade_gate = bool((snapshot["content_malicious"] or snapshot["near_threshold"]) and snapshot["strong_positive_support"] >= 2)
+    if decision == "Phishing":
+        if allow_positive_downgrade and not snapshot["locked_high_risk"] and snapshot["phish_corroboration"] <= 2:
+            review_mode = "downgrade_fp"
+    elif decision == "Spam":
+        if allow_positive_refine and snapshot["account_context"] and snapshot["phish_corroboration"] >= 3:
+            review_mode = "refine_positive"
+        elif allow_positive_downgrade and snapshot["benign_corroboration"] >= 4 and (
+            snapshot["content_margin"] <= 0.18
+            or snapshot["branded_marketing"]
+            or snapshot["routine_business"]
+            or snapshot["rspamd_score"] < 10.0
+        ):
+            review_mode = "downgrade_fp"
+    elif decision == "Normal" and allow_normal_upgrade:
+        if hard_upgrade_gate and snapshot["account_context"] and snapshot["phish_corroboration"] >= 3:
+            review_mode = "upgrade_fn"
+        elif hard_upgrade_gate and snapshot["campaign_matched"] and snapshot["has_spam_signal"]:
+            review_mode = "upgrade_fn"
+        elif hard_upgrade_gate and snapshot["has_spam_signal"] and snapshot["rspamd_score"] >= 8.0:
+            review_mode = "upgrade_fn"
+    return {
+        "enabled": bool(review_mode and gray_reasons),
+        "mode": review_mode,
+        "snapshot": snapshot,
+    }
+
+def _developer_parse_llm_review(text: str) -> dict[str, Any]:
+    verdict, rationale = _developer_parse_llm_verdict(text)
+    cleaned = text.strip()
+    payload_text = cleaned
+    confidence = ""
+    evidence: dict[str, Any] = {}
+    if "{" in cleaned and "}" in cleaned:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        payload_text = cleaned[start : end + 1]
+    try:
+        payload = json.loads(payload_text)
+        confidence = str(payload.get("confidence") or "").strip().lower()
+        evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+        if verdict is None:
+            maybe_verdict = str(payload.get("verdict") or "").strip().title()
+            if maybe_verdict in {"Normal", "Spam", "Phishing"}:
+                verdict = maybe_verdict
+        if not rationale:
+            rationale = str(payload.get("reason") or payload.get("rationale") or "").strip()
+    except Exception:
+        pass
+    return {
+        "ok": verdict in {"Normal", "Spam", "Phishing"},
+        "verdict": verdict,
+        "confidence": confidence,
+        "reason": rationale,
+        "evidence": evidence,
+        "raw_text": text,
+    }
+
+
 def _developer_build_llm_review_prompt(
     *,
-    raw_email: str,
+    subject: str,
+    from_address: str,
+    body_text: str,
     current_decision: str,
     gray_reasons: list[str],
     signal_summary: dict[str, Any],
+    review_mode: str,
 ) -> str:
+    if review_mode == "downgrade_fp":
+        review_goal = (
+            "This is a false-positive review. Be skeptical of malicious interpretations. "
+            "You may keep the current verdict or downgrade it only if there is a reasonable benign explanation. "
+            "Marketing, billing, school, work, maintenance, and routine account notices are often legitimate."
+        )
+    elif review_mode == "upgrade_fn":
+        review_goal = (
+            "This is a false-negative review. You may keep the current verdict or upgrade it only when there is explicit malicious intent. "
+            "Do not upgrade based on branding, urgency, or generic account language alone. "
+            "Look for clear impersonation, credential theft, payment fraud, malicious account-action pressure, or coordinated spam language."
+        )
+    else:
+        review_goal = (
+            "This is a positive-label refinement review. Decide whether the current positive label should stay the same, be downgraded, or be upgraded to phishing. "
+            "Only use Phishing when there is clear impersonation or credential/payment theft pressure."
+        )
+    safe_body = (body_text or "").strip()[:4000]
     return (
-        "You are the final review layer for an email security benchmark.\n"
-        "Your top priority is minimizing false positives. Incorrectly flagging a legitimate email is worse than missing an ordinary spam email.\n"
-        "A deterministic classifier already produced an initial verdict. Preserve that verdict unless there is strong, specific, and corroborated evidence that it is wrong.\n"
-        "Be conservative. Ambiguous, mixed, or weak evidence must keep the current verdict.\n"
-        "Do not upgrade a message to Spam or Phishing based on tone, marketing language, branding, urgency, or a single suspicious clue alone.\n"
-        "Only change Normal to Spam/Phishing when multiple independent signals agree and there is no reasonable benign explanation.\n"
-        "Only change Spam to Phishing when there is clear evidence of impersonation, credential theft, payment fraud, or malicious account-action pressure.\n"
+        "You are a constrained final-review layer for an email security benchmark.\n"
+        "The first-stage classifier is already tuned for very low false positives. Your job is not to replace it. Your job is to correct only the hardest borderline cases.\n"
+        f"{review_goal}\n"
+        "Preserve the current verdict unless the available evidence is strong, specific, and corroborated.\n"
         "If the evidence is mixed or uncertain, return the current verdict unchanged.\n"
-        "Return JSON only with keys verdict, confidence, reason.\n"
-        'Allowed verdict values: "Normal", "Spam", "Phishing".\n\n'
+        "Return JSON only with keys verdict, confidence, reason, evidence.\n"
+        'Allowed verdict values: "Normal", "Spam", "Phishing".\n'
+        'Allowed confidence values: "low", "medium", "high".\n'
+        "The evidence object should be brief booleans such as credential_theft, payment_fraud, impersonation, benign_marketing, routine_notification.\n\n"
         f"Initial verdict: {current_decision}\n"
+        f"Review mode: {review_mode or 'general'}\n"
         f"Why this email was sent to final review: {', '.join(gray_reasons) or 'gray-zone'}\n"
-        f"Existing signals: {json.dumps(signal_summary, ensure_ascii=False)}\n\n"
-        "Raw email follows:\n"
-        f"{raw_email}"
+        f"Existing structured signals: {json.dumps(signal_summary, ensure_ascii=False)}\n\n"
+        f"Subject: {subject}\n"
+        f"From: {from_address}\n"
+        "Readable email body:\n"
+        f"{safe_body or '(empty body)'}"
     )
 
 
@@ -983,10 +1630,13 @@ async def _developer_llm_review_async(
     model: str,
     rspamd_base_url: str,
     ollama_base_url: str,
-    raw_email: str,
+    subject: str,
+    from_address: str,
+    body_text: str,
     current_decision: str,
     gray_reasons: list[str],
     signal_summary: dict[str, Any],
+    review_mode: str,
 ) -> dict[str, Any]:
     runtime = EmailAgentRuntime(
         provider=provider,
@@ -995,23 +1645,112 @@ async def _developer_llm_review_async(
         ollama_base_url=ollama_base_url,
         show_messages=False,
     )
-    await runtime.setup()
+    runtime.model = build_chat_model(
+        provider=provider,
+        model_name=model,
+        temperature=0,
+        ollama_base_url=ollama_base_url,
+    )
     prompt = _developer_build_llm_review_prompt(
-        raw_email=raw_email,
+        subject=subject,
+        from_address=from_address,
+        body_text=body_text,
         current_decision=current_decision,
         gray_reasons=gray_reasons,
         signal_summary=signal_summary,
+        review_mode=review_mode,
     )
-    messages, start_idx = await runtime.ask(prompt)
-    text = latest_ai_message(messages).strip() or render_chat_response(messages, start_idx)
-    verdict, rationale = _developer_parse_llm_verdict(text)
-    return {
-        "ok": verdict in {"Normal", "Spam", "Phishing"},
-        "verdict": verdict,
-        "reason": rationale,
-        "raw_text": text,
-    }
+    latest_messages = [
+        SystemMessage(content=runtime.system_prompt),
+        HumanMessage(content=prompt),
+    ]
+    timeout_s = float(os.getenv("GRAY_ZONE_REVIEW_TIMEOUT", "45"))
+    ai_message = await asyncio.wait_for(
+        runtime._invoke_direct_chat(
+            latest_messages,
+            prompt=prompt,
+        ),
+        timeout=timeout_s,
+    )
+    text = render_content(ai_message.content).strip()
+    return _developer_parse_llm_review(text)
 
+
+def _developer_apply_llm_review(
+    *,
+    current_decision: str,
+    llm_review: dict[str, Any],
+    review_mode: str,
+    snapshot: dict[str, Any],
+) -> tuple[str, bool, str]:
+    proposed = str(llm_review.get("verdict") or "").title()
+    confidence = str(llm_review.get("confidence") or "").lower()
+    reason = str(llm_review.get("reason") or "").strip()
+    current_rank = _developer_verdict_rank(current_decision)
+    proposed_rank = _developer_verdict_rank(proposed)
+    if proposed_rank < 0:
+        return current_decision, False, "invalid-llm-verdict"
+
+    if review_mode == "downgrade_fp":
+        if proposed_rank > current_rank:
+            return current_decision, False, "fp-guardrail-blocked-upgrade"
+        if proposed_rank == current_rank:
+            return current_decision, False, "llm-kept-current-verdict"
+        if confidence not in {"medium", "high"}:
+            return current_decision, False, "fp-guardrail-needs-medium-confidence"
+        if snapshot.get("benign_corroboration", 0) < 4:
+            return current_decision, False, "fp-guardrail-needs-benign-corroboration"
+        if current_decision == "Phishing" and proposed == "Normal" and snapshot.get("phish_corroboration", 0) >= 2:
+            return current_decision, False, "fp-guardrail-blocked-hard-phishing-to-normal"
+        return proposed, True, reason or "llm-downgraded-borderline-positive"
+
+    if review_mode == "refine_positive":
+        if proposed_rank == current_rank:
+            return current_decision, False, "llm-kept-current-verdict"
+        if proposed == "Phishing":
+            if confidence == "high" and snapshot.get("account_context") and snapshot.get("phish_corroboration", 0) >= 3:
+                return proposed, True, reason or "llm-upgraded-spam-to-phishing"
+            return current_decision, False, "positive-refine-needs-high-phish-corroboration"
+        if proposed_rank < current_rank:
+            if confidence in {"medium", "high"} and snapshot.get("benign_corroboration", 0) >= 4:
+                return proposed, True, reason or "llm-downgraded-borderline-positive"
+            return current_decision, False, "positive-refine-needs-benign-corroboration"
+        return current_decision, False, "positive-refine-no-applicable-change"
+
+    if review_mode == "upgrade_fn":
+        if proposed_rank <= current_rank:
+            return current_decision, False, "llm-kept-current-verdict"
+        if confidence != "high":
+            return current_decision, False, "fn-guardrail-needs-high-confidence"
+        if not (snapshot.get("content_malicious") or snapshot.get("near_threshold")):
+            return current_decision, False, "fn-guardrail-needs-content-support"
+        if snapshot.get("strong_positive_support", 0) < 2:
+            return current_decision, False, "fn-guardrail-needs-two-independent-signals"
+        if proposed == "Spam":
+            strong_spam_support = sum(
+                1
+                for condition in (
+                    snapshot.get("campaign_matched"),
+                    snapshot.get("has_spam_signal"),
+                    snapshot.get("rspamd_score", 0.0) >= 8.0,
+                )
+                if condition
+            )
+            if strong_spam_support >= 2:
+                return proposed, True, reason or "llm-upgraded-borderline-negative-to-spam"
+            return current_decision, False, "fn-guardrail-needs-spam-corroboration"
+        if proposed == "Phishing":
+            if snapshot.get("account_context") and snapshot.get("phish_corroboration", 0) >= 3 and snapshot.get("strong_positive_support", 0) >= 3 and (
+                snapshot.get("header_risk") in {"medium", "high"}
+                or snapshot.get("url_risk") in {"medium", "high"}
+                or snapshot.get("url_suspicious")
+                or snapshot.get("scam_matched")
+            ):
+                return proposed, True, reason or "llm-upgraded-borderline-negative-to-phishing"
+            return current_decision, False, "fn-guardrail-needs-phishing-corroboration"
+        return current_decision, False, "fn-guardrail-no-applicable-change"
+
+    return current_decision, False, "no-review-mode"
 
 def _developer_predict_row(
     row: dict[str, str],
@@ -1021,6 +1760,9 @@ def _developer_predict_row(
     model: str = "",
     ollama_base_url: str = "",
     llm_review_enabled: bool = False,
+    llm_allow_positive_downgrade: bool = True,
+    llm_allow_positive_refine: bool = True,
+    llm_allow_normal_upgrade: bool = False,
     puter_review_func: Callable[[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     raw_email = _developer_build_raw_email(row)
@@ -1146,13 +1888,46 @@ def _developer_predict_row(
     if content_data:
         if not bool(content_data.get("is_malicious")) and decision != "Phishing":
             decision = "Normal"
-        elif bool(content_data.get("is_malicious")) and decision != "Phishing":
+        elif (
+            bool(content_data.get("is_malicious"))
+                and decision != "Phishing"
+                and _content_supports_spam_override(
+                    content_data,
+                    rspamd_data=rspamd_data,
+                    campaign_data=campaign_data,
+                    subject=subject,
+                    from_address=from_address,
+                    email_text=email_text,
+                )
+        ):
             decision = "Spam"
+    if (
+        decision == "Spam"
+        and _looks_like_legit_marketing_email(
+            rspamd_data=rspamd_data,
+            content_data=content_data,
+            header_data=header_data,
+            url_data=url_data,
+            urgency_data=urgency_data,
+            scam_data=scam_data,
+            campaign_data=campaign_data,
+            subject=subject,
+            from_address=from_address,
+            email_text=email_text,
+        )
+    ):
+        decision = "Normal"
 
+    baseline_decision = decision
+    baseline_predicted_binary = 0 if baseline_decision == "Normal" else 1
     llm_review_used = False
+    llm_review_applied = False
     llm_review_decision = ""
     llm_review_reason = ""
     llm_review_error = ""
+    llm_review_confidence = ""
+    llm_review_mode = ""
+    llm_review_guardrail = ""
     gray_reasons = _developer_gray_zone_reasons(
         decision=decision,
         rspamd_data=rspamd_data,
@@ -1163,7 +1938,26 @@ def _developer_predict_row(
         scam_data=scam_data,
         campaign_data=campaign_data,
     )
-    if llm_review_enabled and provider and model and gray_reasons:
+    body_text = _mail_body_text(raw_email.encode("utf-8", errors="replace")) or email_text or raw_email
+    review_plan = _developer_llm_review_plan(
+        decision=decision,
+        rspamd_data=rspamd_data,
+        content_data=content_data,
+        header_data=header_data,
+        url_data=url_data,
+        urgency_data=urgency_data,
+        scam_data=scam_data,
+        campaign_data=campaign_data,
+        subject=subject,
+        from_address=from_address,
+        email_text=body_text,
+        gray_reasons=gray_reasons,
+        allow_positive_downgrade=llm_allow_positive_downgrade,
+        allow_positive_refine=llm_allow_positive_refine,
+        allow_normal_upgrade=llm_allow_normal_upgrade,
+    )
+    llm_review_mode = str(review_plan.get("mode") or "")
+    if llm_review_enabled and provider and model and bool(review_plan.get("enabled")):
         signal_summary = {
             "rspamd_score": rspamd_score,
             "rspamd_action": rspamd_data.get("action"),
@@ -1179,16 +1973,21 @@ def _developer_predict_row(
             "spam_campaign_matched": campaign_data.get("matched"),
             "scam_reasons": obvious_reasons,
             "campaign_reasons": campaign_reasons,
+            "review_snapshot": review_plan.get("snapshot") or {},
         }
         try:
             if provider == PUTER_PROVIDER and puter_review_func is not None:
                 prompt = _developer_build_llm_review_prompt(
-                    raw_email=raw_email,
+                    subject=subject,
+                    from_address=from_address,
+                    body_text=body_text,
                     current_decision=decision,
                     gray_reasons=gray_reasons,
                     signal_summary=signal_summary,
+                    review_mode=llm_review_mode,
                 )
                 llm_review = puter_review_func(prompt, model)
+                llm_review = _developer_parse_llm_review(str(llm_review.get("raw_text") or json.dumps(llm_review, ensure_ascii=False))) if isinstance(llm_review, dict) and not llm_review.get("ok") else llm_review
             else:
                 llm_review = asyncio.run(
                     _developer_llm_review_async(
@@ -1196,21 +1995,30 @@ def _developer_predict_row(
                         model=model,
                         rspamd_base_url=rspamd_base_url,
                         ollama_base_url=ollama_base_url,
-                        raw_email=raw_email,
+                        subject=subject,
+                        from_address=from_address,
+                        body_text=body_text,
                         current_decision=decision,
                         gray_reasons=gray_reasons,
                         signal_summary=signal_summary,
+                        review_mode=llm_review_mode,
                     )
                 )
         except Exception as exc:
-            llm_review = {"ok": False, "verdict": None, "reason": str(exc), "raw_text": ""}
+            llm_review = {"ok": False, "verdict": None, "confidence": "", "reason": str(exc), "raw_text": ""}
         if not llm_review.get("ok"):
             llm_review_error = str(llm_review.get("reason") or "LLM final review did not return a valid verdict.")
-        if llm_review.get("ok") and llm_review.get("verdict") in {"Normal", "Spam", "Phishing"}:
+        else:
             llm_review_used = True
             llm_review_decision = str(llm_review.get("verdict") or "")
             llm_review_reason = str(llm_review.get("reason") or "")
-            decision = llm_review_decision
+            llm_review_confidence = str(llm_review.get("confidence") or "")
+            decision, llm_review_applied, llm_review_guardrail = _developer_apply_llm_review(
+                current_decision=decision,
+                llm_review=llm_review,
+                review_mode=llm_review_mode,
+                snapshot=review_plan.get("snapshot") or {},
+            )
             tools_called.append("llm_final_review")
 
     predicted_binary = 0 if decision == "Normal" else 1
@@ -1218,6 +2026,8 @@ def _developer_predict_row(
     return {
         "source": row.get("source", ""),
         "source_record_id": row.get("source_record_id", ""),
+        "baseline_verdict": baseline_decision,
+        "baseline_predicted_binary": baseline_predicted_binary,
         "subject": subject,
         "sender": from_address,
         "actual_binary": actual_binary,
@@ -1240,12 +2050,16 @@ def _developer_predict_row(
         "spam_campaign_reasons": campaign_reasons,
         "gray_zone_reasons": gray_reasons,
         "llm_review_used": llm_review_used,
+        "llm_review_applied": llm_review_applied,
+        "llm_review_mode": llm_review_mode,
         "llm_review_decision": llm_review_decision,
+        "llm_review_confidence": llm_review_confidence,
         "llm_review_reason": llm_review_reason,
+        "llm_review_guardrail": llm_review_guardrail,
         "llm_review_error": llm_review_error,
         "patterns_checked": patterns_count,
         "tools_called": tools_called,
-        "flow": "content_model_ifelse_no_llm_v1",
+        "flow": "content_model_ifelse_llm_guardrail_v2" if llm_review_enabled else "content_model_ifelse_no_llm_v1",
     }
 
 
@@ -1280,7 +2094,7 @@ class DeveloperExperimentWorker(QObject):
             return {
                 "ok": False,
                 "verdict": None,
-                "reason": "Timed out waiting for Puter bridge final review.",
+                "reason": "Timed out waiting for ChatGPT final review.",
                 "raw_text": "",
             }
         result = payload.get("result")
@@ -1289,7 +2103,7 @@ class DeveloperExperimentWorker(QObject):
         return {
             "ok": False,
             "verdict": None,
-            "reason": "Puter bridge final review returned no result.",
+            "reason": "ChatGPT final review returned no result.",
             "raw_text": "",
         }
 
@@ -1302,7 +2116,7 @@ class DeveloperExperimentWorker(QObject):
             sample_mode = str(self.config.get("sample_mode") or "Sequential")
             seed = int(self.config.get("seed") or 42)
             run_dir = Path(self.config["run_dir"])
-            run_dir.mkdir(parents=True, exist_ok=True)
+            _developer_prepare_run_dir(run_dir, overwrite=bool(self.config.get("overwrite_run_dir")))
             results_path = run_dir / "results.jsonl"
             metrics_path = run_dir / "metrics.json"
             log_path = run_dir / "log.txt"
@@ -1336,7 +2150,16 @@ class DeveloperExperimentWorker(QObject):
                         provider=str(self.config.get("provider") or ""),
                         model=str(self.config.get("model") or ""),
                         ollama_base_url=str(self.config.get("ollama_base_url") or ""),
-                        llm_review_enabled=False,
+                        llm_review_enabled=bool(self.config.get("llm_final_review")),
+                        llm_allow_positive_downgrade=bool(
+                            self.config.get("llm_allow_positive_downgrade", True)
+                        ),
+                        llm_allow_positive_refine=bool(
+                            self.config.get("llm_allow_positive_refine", True)
+                        ),
+                        llm_allow_normal_upgrade=bool(
+                            self.config.get("llm_allow_normal_upgrade", False)
+                        ),
                         puter_review_func=self._request_puter_review,
                     )
                     record["run_index"] = offset + idx
@@ -1352,8 +2175,10 @@ class DeveloperExperimentWorker(QObject):
                     out.flush()
                     log_handle.write(
                         f"[{idx}/{total}] actual={record['actual_binary']} pred={record['predicted_binary']} "
-                        f"score={record['rspamd_score']} llm_review={record.get('llm_review_used')} "
+                        f"baseline={record.get('baseline_predicted_binary')} score={record['rspamd_score']} "
+                        f"llm_review={record.get('llm_review_used')} llm_applied={record.get('llm_review_applied')} "
                         f"llm_success={llm_success_count} llm_errors={llm_error_count} "
+                        f"llm_guardrail={record.get('llm_review_guardrail') or ''} "
                         f"llm_error={record.get('llm_review_error') or ''} "
                         f"subject={record['subject'][:80]}\n"
                     )
@@ -1465,6 +2290,7 @@ class DeveloperMetricsChart(QWidget):
         self.update()
 
     def paintEvent(self, event: Any) -> None:
+        del event
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), QColor("#ffffff"))
@@ -1480,74 +2306,127 @@ class DeveloperMetricsChart(QWidget):
         title_font.setPointSize(12)
         title_font.setBold(True)
         painter.setFont(title_font)
-        painter.drawText(title_rect, Qt.AlignLeft | Qt.AlignVCenter, "Metric Comparison")
+        painter.drawText(title_rect, Qt.AlignLeft | Qt.AlignVCenter, "Test Comparison Matrix")
 
-        metrics = [
-            ("accuracy", "Accuracy", 1.0, False),
-            ("recall", "Recall", 1.0, False),
-            ("precision", "Precision", 1.0, False),
-            ("fpr", "FPR", 0.2, True),
+        hint_font = QFont(painter.font())
+        hint_font.setPointSize(9)
+        hint_font.setBold(False)
+        painter.setFont(hint_font)
+        painter.setPen(QColor("#64748b"))
+        painter.drawText(
+            QRectF(outer.left() + 12, outer.top() + 34, outer.width() - 24, 20),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            "Green means closer to the target: FPR <= 1%, Recall >= 90%.",
+        )
+
+        columns = [
+            ("total", "Total", "count"),
+            ("fpr", "FPR", "fpr"),
+            ("recall", "Recall", "recall"),
+            ("precision", "Precision", "precision"),
+            ("llm_used", "LLM Review", "count_neutral"),
+            ("llm_applied", "Accepted", "count_neutral"),
+            ("fp", "FP", "count_bad"),
+            ("fn", "FN", "count_bad"),
         ]
         colors = ["#16697a", "#f59e0b", "#2563eb", "#dc2626"]
-        chart_top = outer.top() + 54
-        chart_bottom = outer.bottom() - 72
-        chart_height = chart_bottom - chart_top
-        group_width = outer.width() / max(1, len(metrics))
-        bar_width = max(12.0, min(28.0, group_width / 6.0))
-
-        axis_pen = QPen(QColor("#cbd5e1"), 1)
         label_font = QFont(painter.font())
         label_font.setPointSize(9)
         painter.setFont(label_font)
 
-        for group_idx, (metric_key, metric_label, scale_max, invert) in enumerate(metrics):
-            group_left = outer.left() + group_idx * group_width
-            baseline_y = chart_bottom
-            painter.setPen(axis_pen)
-            painter.drawLine(int(group_left + 20), int(baseline_y), int(group_left + group_width - 10), int(baseline_y))
-            painter.setPen(QColor("#475569"))
-            painter.drawText(
-                QRectF(group_left + 6, chart_bottom + 6, group_width - 12, 18),
-                Qt.AlignCenter,
-                metric_label,
-            )
-            for slot_idx in range(DEVELOPER_SLOT_COUNT):
-                metrics_for_slot = self._slot_metrics.get(slot_idx, {})
-                raw_value = metrics_for_slot.get(metric_key)
-                if raw_value is None:
-                    continue
-                value = float(raw_value)
-                normalized = max(0.0, min(1.0, value / scale_max))
-                if invert:
-                    normalized = 1.0 - normalized
-                bar_height = normalized * (chart_height - 28)
-                x = group_left + 30 + slot_idx * (bar_width + 8)
-                y = baseline_y - bar_height
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor(colors[slot_idx % len(colors)]))
-                painter.drawRoundedRect(QRectF(x, y, bar_width, bar_height), 4, 4)
-                painter.setPen(QColor("#334155"))
-                painter.drawText(
-                    QRectF(x - 10, y - 18, bar_width + 20, 16),
-                    Qt.AlignCenter,
-                    f"{value:.3f}",
-                )
+        table_left = outer.left() + 14
+        table_top = outer.top() + 68
+        table_right = outer.right() - 14
+        row_label_width = 72.0
+        row_height = 36.0
+        header_height = 28.0
+        column_width = (table_right - table_left - row_label_width) / len(columns)
 
-        legend_y = outer.bottom() - 34
-        painter.setFont(label_font)
+        painter.setPen(QColor("#64748b"))
+        for col_idx, (_key, label, _kind) in enumerate(columns):
+            x = table_left + row_label_width + col_idx * column_width
+            painter.drawText(
+                QRectF(x + 4, table_top, column_width - 8, header_height),
+                Qt.AlignCenter,
+                label,
+            )
+
         for slot_idx in range(DEVELOPER_SLOT_COUNT):
-            x = outer.left() + 20 + slot_idx * 110
+            metrics_for_slot = self._slot_metrics.get(slot_idx, {})
+            y = table_top + header_height + slot_idx * row_height
+            row_rect = QRectF(table_left, y, table_right - table_left, row_height - 4)
+            painter.setPen(QPen(QColor("#e2e8f0"), 1))
+            painter.setBrush(QColor("#f8fafc") if slot_idx % 2 == 0 else QColor("#ffffff"))
+            painter.drawRoundedRect(row_rect, 7, 7)
+
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(colors[slot_idx % len(colors)]))
-            painter.drawRoundedRect(QRectF(x, legend_y, 14, 14), 3, 3)
+            painter.drawRoundedRect(QRectF(table_left + 8, y + 10, 12, 12), 3, 3)
+            painter.setPen(QColor("#0f172a"))
+            painter.drawText(QRectF(table_left + 26, y + 3, row_label_width - 30, row_height - 8), Qt.AlignLeft | Qt.AlignVCenter, f"Test {slot_idx + 1}")
+
+            for col_idx, (metric_key, _label, kind) in enumerate(columns):
+                raw_value = metrics_for_slot.get(metric_key)
+                x = table_left + row_label_width + col_idx * column_width + 4
+                cell_rect = QRectF(x, y + 5, column_width - 8, row_height - 12)
+                value: float | None = float(raw_value) if isinstance(raw_value, (int, float)) else None
+
+                if value is None:
+                    fill = QColor("#f1f5f9")
+                    text = "Waiting"
+                elif kind == "fpr":
+                    fill = QColor("#dcfce7") if value <= 0.01 else QColor("#fef3c7") if value <= 0.02 else QColor("#fee2e2")
+                    text = _developer_format_metric(value)
+                elif kind == "recall":
+                    fill = QColor("#dcfce7") if value >= 0.9 else QColor("#fef3c7") if value >= 0.8 else QColor("#fee2e2")
+                    text = _developer_format_metric(value)
+                elif kind == "precision":
+                    fill = QColor("#dcfce7") if value >= 0.95 else QColor("#fef3c7") if value >= 0.9 else QColor("#fee2e2")
+                    text = _developer_format_metric(value)
+                elif kind == "count_bad":
+                    fill = QColor("#f8fafc") if value == 0 else QColor("#fef3c7") if value <= 5 else QColor("#fee2e2")
+                    text = str(int(value))
+                elif kind == "count_neutral":
+                    fill = QColor("#dbeafe") if value > 0 else QColor("#f1f5f9")
+                    text = str(int(value))
+                else:
+                    fill = QColor("#f1f5f9")
+                    text = str(int(value))
+
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(fill)
+                painter.drawRoundedRect(cell_rect, 6, 6)
+                painter.setPen(QColor("#334155"))
+                painter.drawText(
+                    cell_rect,
+                    Qt.AlignCenter,
+                    text,
+                )
+
+        legend_y = outer.bottom() - 28
+        painter.setFont(label_font)
+        legend_items = [
+            (QColor("#dcfce7"), "Target"),
+            (QColor("#fef3c7"), "Watch"),
+            (QColor("#fee2e2"), "Risk"),
+        ]
+        legend_x = outer.left() + 16
+        for color, label in legend_items:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawRoundedRect(QRectF(legend_x, legend_y, 16, 16), 4, 4)
             painter.setPen(QColor("#334155"))
-            painter.drawText(QRectF(x + 20, legend_y - 1, 80, 18), Qt.AlignLeft | Qt.AlignVCenter, f"Test {slot_idx + 1}")
+            painter.drawText(QRectF(legend_x + 22, legend_y - 1, 92, 18), Qt.AlignLeft | Qt.AlignVCenter, label)
+            legend_x += 118
 
 
-def _direct_email_analysis(
+async def _direct_email_analysis(
     email_items: list[dict[str, str]],
     *,
     rspamd_base_url: str,
+    provider: str,
+    model: str,
+    ollama_base_url: str,
     progress: Any,
 ) -> str:
     rspamd_spam_threshold = 7.0
@@ -1714,8 +2593,112 @@ def _direct_email_analysis(
         if content_data:
             if not bool(content_data.get("is_malicious")) and decision != "Phishing":
                 decision = "Normal"
-            elif bool(content_data.get("is_malicious")) and decision != "Phishing":
+            elif (
+                bool(content_data.get("is_malicious"))
+                and decision != "Phishing"
+                and _content_supports_spam_override(
+                    content_data,
+                    rspamd_data=rspamd_data,
+                    campaign_data=campaign_data,
+                    subject=subject,
+                    from_address=from_address,
+                    email_text=body_text,
+                )
+            ):
                 decision = "Spam"
+        if (
+            decision == "Spam"
+            and _looks_like_legit_marketing_email(
+                rspamd_data=rspamd_data,
+                content_data=content_data,
+                header_data=header_data,
+                url_data=url_data,
+                urgency_data=urgency_data,
+                scam_data=scam_data,
+                campaign_data=campaign_data,
+                subject=subject,
+                from_address=from_address,
+                email_text=body_text,
+            )
+        ):
+            decision = "Normal"
+
+        gray_reasons = _developer_gray_zone_reasons(
+            decision=decision,
+            rspamd_data=rspamd_data,
+            content_data=content_data,
+            header_data=header_data,
+            url_data=url_data,
+            urgency_data=urgency_data,
+            scam_data=scam_data,
+            campaign_data=campaign_data,
+        )
+        body_text = _mail_body_text(raw_email.encode("utf-8", errors="replace")) or raw_email
+        review_plan = _developer_llm_review_plan(
+            decision=decision,
+            rspamd_data=rspamd_data,
+            content_data=content_data,
+            header_data=header_data,
+            url_data=url_data,
+            urgency_data=urgency_data,
+            scam_data=scam_data,
+            campaign_data=campaign_data,
+            subject=subject,
+            from_address=from_address,
+            email_text=body_text,
+            gray_reasons=gray_reasons,
+        )
+        llm_review_used = False
+        llm_review_applied = False
+        llm_review_reason = ""
+        llm_review_guardrail = ""
+        llm_review_mode = str(review_plan.get("mode") or "")
+        if provider and model and bool(review_plan.get("enabled")):
+            progress.emit("Gray-zone email; asking the LLM for constrained final review")
+            signal_summary = {
+                "rspamd_score": rspamd_score,
+                "rspamd_action": rspamd_data.get("action"),
+                "rspamd_risk": rspamd_data.get("risk_level"),
+                "content_score": content_data.get("malicious_score"),
+                "content_threshold": content_data.get("threshold"),
+                "content_risk": content_data.get("risk_level"),
+                "header_risk": header_data.get("risk_level"),
+                "url_risk": url_data.get("risk_level"),
+                "url_suspicious": url_data.get("is_suspicious"),
+                "urgency_label": urgency_data.get("urgency_label"),
+                "scam_matched": scam_data.get("matched"),
+                "spam_campaign_matched": campaign_data.get("matched"),
+                "scam_reasons": obvious_phishing_reasons,
+                "campaign_reasons": campaign_reasons,
+                "review_snapshot": review_plan.get("snapshot") or {},
+            }
+            try:
+                llm_review = await _developer_llm_review_async(
+                    provider=provider,
+                    model=model,
+                    rspamd_base_url=rspamd_base_url,
+                    ollama_base_url=ollama_base_url,
+                    subject=subject,
+                    from_address=from_address,
+                    body_text=body_text,
+                    current_decision=decision,
+                    gray_reasons=gray_reasons,
+                    signal_summary=signal_summary,
+                    review_mode=llm_review_mode,
+                )
+            except Exception as exc:
+                llm_review = {"ok": False, "reason": str(exc)}
+            if llm_review.get("ok"):
+                llm_review_used = True
+                decision, llm_review_applied, llm_review_guardrail = _developer_apply_llm_review(
+                    current_decision=decision,
+                    llm_review=llm_review,
+                    review_mode=llm_review_mode,
+                    snapshot=review_plan.get("snapshot") or {},
+                )
+                llm_review_reason = str(llm_review.get("reason") or "")
+            else:
+                llm_review_guardrail = str(llm_review.get("reason") or "LLM review did not return a valid verdict.")
 
         lines.extend([f"Verdict: {decision}", "Why this conclusion:"])
         if rspamd_result.ok:
@@ -1781,7 +2764,18 @@ def _direct_email_analysis(
                 lines.append("- Even though the scanner score was high, the extra checks gave a clear benign explanation, so it was not called spam or phishing.")
             else:
                 lines.append("- Even though the scanner score was somewhat elevated, the extra checks did not support calling it spam or phishing.")
+        if gray_reasons:
+            lines.append(f"- Gray-zone review reasons: {', '.join(gray_reasons)}.")
+            if llm_review_used:
+                if llm_review_applied:
+                    lines.append(f"- The constrained LLM review changed the decision: {llm_review_reason or llm_review_guardrail}.")
+                else:
+                    lines.append(f"- The constrained LLM review kept the rule-based decision: {llm_review_guardrail or llm_review_reason or 'no guarded change was allowed'}.")
+            elif llm_review_guardrail:
+                lines.append(f"- LLM gray-zone review was skipped or unavailable: {llm_review_guardrail}.")
         tools = ["rspamd_scan_email"]
+        if content_result is not None:
+            tools.append("content_model_check")
         if scam_result is not None:
             tools.append("scam_indicator_check")
         if campaign_result is not None:
@@ -1794,6 +2788,8 @@ def _direct_email_analysis(
             tools.append("list_error_patterns")
         if memory_result is not None:
             tools.append("error_pattern_memory_check")
+        if llm_review_used:
+            tools.append("llm_final_review")
         lines.extend(["", "Tools called: " + ", ".join(f"`{name}`" for name in tools)])
         sections.append("\n".join(lines))
 
@@ -1845,46 +2841,61 @@ class AgentWorker(QObject):
         finally:
             self.finished.emit()
 
+    async def _build_runtime_for_current_thread(self) -> EmailAgentRuntime:
+        previous_history: list[BaseMessage] | None = None
+        if self.runtime is not None:
+            previous_history = list(self.runtime.history)
+            self.progress.emit("Refreshing chat runtime for this request")
+        else:
+            self.progress.emit("Initializing Email Guardian runtime")
+
+        runtime = EmailAgentRuntime(
+            provider=self.provider,
+            model_name=self.model,
+            rspamd_base_url=self.rspamd_base_url,
+            ollama_base_url=self.ollama_base_url,
+            show_messages=self.trace,
+        )
+        await runtime.setup()
+        if previous_history:
+            runtime.history = previous_history
+        self.runtime = runtime
+        self.updated_runtime = runtime
+        self.ready.emit(f"{self.provider} / {self.model}")
+        return runtime
+
     async def _run(self) -> None:
         if self.direct_referenced_emails is not None:
             self.result.emit(
-                _direct_email_analysis(
+                await _direct_email_analysis(
                     self.direct_referenced_emails,
                     rspamd_base_url=self.rspamd_base_url,
+                    provider=self.provider,
+                    model=self.model,
+                    ollama_base_url=self.ollama_base_url,
                     progress=self.progress,
                 )
             )
             return
 
-        if self.runtime is None:
-            self.progress.emit("Initializing Email Guardian runtime")
-            self.runtime = EmailAgentRuntime(
-                provider=self.provider,
-                model_name=self.model,
-                rspamd_base_url=self.rspamd_base_url,
-                ollama_base_url=self.ollama_base_url,
-                show_messages=self.trace,
-            )
-            await self.runtime.setup()
-            self.updated_runtime = self.runtime
-            self.ready.emit(f"{self.provider} / {self.model}")
+        runtime = await self._build_runtime_for_current_thread()
 
         if self.setup_only:
             return
 
-        self.runtime.show_messages = self.trace
+        runtime.show_messages = self.trace
         if self.reset:
-            self.runtime.reset()
+            runtime.reset()
             self.progress.emit("Conversation history cleared")
 
-        start_idx = len(self.runtime.history)
+        start_idx = len(runtime.history)
         try:
-            messages, start_idx = await self.runtime.ask(
+            messages, start_idx = await runtime.ask(
                 self.prompt,
                 progress_callback=self.progress.emit,
             )
         except Exception as exc:
-            tool_summary = summarize_tool_messages(self.runtime.history, start_idx)
+            tool_summary = summarize_tool_messages(runtime.history, start_idx)
             self.result.emit(
                 render_error(
                     exc,
@@ -2094,6 +3105,15 @@ class PetWindow(QMainWindow):
         self.dev_slot_metric_views: dict[int, QWidget] = {}
         self.dev_slot_progress_views: dict[int, dict[str, Any]] = {}
         self.dev_slot_metrics: dict[int, dict[str, Any]] = {}
+        self.dev_slot_timing: dict[int, dict[str, Any]] = {
+            idx: {"started_at": None, "finished_at": None, "state": "idle"}
+            for idx in range(DEVELOPER_SLOT_COUNT)
+        }
+        self.dev_export_dashboard_button: QPushButton | None = None
+        self.dev_elapsed_timer = QTimer(self)
+        self.dev_elapsed_timer.setInterval(1000)
+        self.dev_elapsed_timer.timeout.connect(self._developer_refresh_timing_labels)
+        self.dev_elapsed_timer.start()
         self._pre_dev_geometry: QRect | None = None
         self._pre_dev_flags = None
         self.puter_bridge: PuterBridgeController | None = None
@@ -2259,17 +3279,26 @@ class PetWindow(QMainWindow):
         model_label = QLabel("Model")
         model_label.setObjectName("sectionLabel")
         self.provider_combo = QComboBox()
-        self.provider_combo.addItems(["gemini", "ollama", PUTER_PROVIDER])
-        self.model_input = QLineEdit(self.args.model)
-        self.model_input.setPlaceholderText("model name")
+        self.provider_combo.addItems(["gemini", "ollama", TOKENROUTER_PROVIDER, PUTER_PROVIDER])
+        self.model_input = QComboBox()
+        self.model_input.setObjectName("modelInput")
         self.switch_model_button = QPushButton("Switch Model")
         self.switch_model_button.clicked.connect(self.switch_model)
+        self.chatgpt_login_button = QPushButton("登录 ChatGPT")
+        self.chatgpt_login_button.setObjectName("secondaryButton")
+        self.chatgpt_login_button.clicked.connect(self.login_chatgpt)
+        self.chatgpt_logout_button = QPushButton("退出登录 ChatGPT")
+        self.chatgpt_logout_button.setObjectName("secondaryButton")
+        self.chatgpt_logout_button.clicked.connect(self.logout_chatgpt)
         self.provider_combo.setCurrentText(self.args.provider)
         self.provider_combo.currentTextChanged.connect(self.update_model_default)
+        _configure_model_selector(self.model_input, self.args.provider, self.args.model)
         side_layout.addWidget(model_label)
         side_layout.addWidget(self.provider_combo)
         side_layout.addWidget(self.model_input)
         side_layout.addWidget(self.switch_model_button)
+        side_layout.addWidget(self.chatgpt_login_button)
+        side_layout.addWidget(self.chatgpt_logout_button)
 
         mailbox_label = QLabel("Mailboxes")
         mailbox_label.setObjectName("sectionLabel")
@@ -2518,7 +3547,7 @@ class PetWindow(QMainWindow):
             dataset_info.setWordWrap(True)
             source_list = QListWidget()
             source_list.setObjectName("developerSourceList")
-            source_list.setFixedHeight(92)
+            source_list.setFixedHeight(188)
             limit_spin = QSpinBox()
             limit_spin.setRange(1, 100000)
             limit_spin.setValue(100)
@@ -2532,13 +3561,17 @@ class PetWindow(QMainWindow):
                 "Ham only",
             ])
             sample_mode_combo.setCurrentText("Balanced 50/50 ham/spam")
+            llm_review_check = QCheckBox("Use LLM final review")
+            llm_review_check.setObjectName("developerLlmCheck")
+            llm_review_check.setChecked(True)
             model_combo = QComboBox()
-            model_combo.addItems(["gemini", "ollama", PUTER_PROVIDER])
+            model_combo.addItems(["gemini", "ollama", TOKENROUTER_PROVIDER, PUTER_PROVIDER])
             model_combo.setCurrentText(self.args.provider)
-            model_input = QLineEdit(self.args.model)
-            model_input.setPlaceholderText("model name")
+            model_input = QComboBox()
+            model_input.setObjectName("modelInput")
+            _configure_model_selector(model_input, self.args.provider, self.args.model)
             model_combo.currentTextChanged.connect(
-                lambda provider, field=model_input: field.setText(_desktop_model_default(provider))
+                lambda provider, field=model_input: _configure_model_selector(field, provider, _desktop_model_default(provider))
             )
             slot_actions = QHBoxLayout()
             start_button = QPushButton("Start")
@@ -2567,7 +3600,8 @@ class PetWindow(QMainWindow):
             slot_layout.addWidget(limit_spin)
             slot_layout.addWidget(QLabel("Sampling mode"))
             slot_layout.addWidget(sample_mode_combo)
-            slot_layout.addWidget(QLabel("Configured model (not used by no-LLM rule engine)"))
+            slot_layout.addWidget(llm_review_check)
+            slot_layout.addWidget(QLabel("LLM provider and model"))
             slot_layout.addWidget(model_combo)
             slot_layout.addWidget(model_input)
             slot_layout.addLayout(slot_actions)
@@ -2579,6 +3613,7 @@ class PetWindow(QMainWindow):
                     "source_list": source_list,
                     "limit_spin": limit_spin,
                     "sample_mode_combo": sample_mode_combo,
+                    "llm_review_check": llm_review_check,
                     "model_combo": model_combo,
                     "model_input": model_input,
                     "start_button": start_button,
@@ -2605,7 +3640,15 @@ class PetWindow(QMainWindow):
         center_layout.setSpacing(10)
         result_title = QLabel("Experiment Comparison")
         result_title.setObjectName("developerTitle")
-        center_layout.addWidget(result_title)
+        result_header = QHBoxLayout()
+        result_header.addWidget(result_title)
+        result_header.addStretch()
+        self.dev_export_dashboard_button = QPushButton("Export Dashboard")
+        self.dev_export_dashboard_button.setObjectName("secondaryButton")
+        self.dev_export_dashboard_button.setEnabled(False)
+        self.dev_export_dashboard_button.clicked.connect(self.export_developer_dashboard)
+        result_header.addWidget(self.dev_export_dashboard_button)
+        center_layout.addLayout(result_header)
         summaries_grid = QGridLayout()
         summaries_grid.setSpacing(10)
         self.dev_slot_metric_views = {}
@@ -2643,6 +3686,9 @@ class PetWindow(QMainWindow):
             box_layout.setSpacing(6)
             label = QLabel(f"Test {slot_idx + 1}: Idle")
             label.setObjectName("sectionLabel")
+            timing_label = QLabel("Started: n/a\nFinished: n/a\nElapsed: 00:00")
+            timing_label.setObjectName("status")
+            timing_label.setWordWrap(True)
             progress_bar = QProgressBar()
             progress_bar.setRange(0, 100)
             progress_bar.setValue(0)
@@ -2652,11 +3698,13 @@ class PetWindow(QMainWindow):
             log_view.setPlaceholderText(f"Test {slot_idx + 1} logs")
             log_view.setMinimumHeight(120)
             box_layout.addWidget(label)
+            box_layout.addWidget(timing_label)
             box_layout.addWidget(progress_bar)
             box_layout.addWidget(log_view)
             right_layout.addWidget(box)
             self.dev_slot_progress_views[slot_idx] = {
                 "status_label": label,
+                "timing_label": timing_label,
                 "progress_bar": progress_bar,
                 "log_view": log_view,
             }
@@ -2882,6 +3930,36 @@ class PetWindow(QMainWindow):
             QPushButton:disabled {
                 background: #9aa7b2;
             }
+            QMessageBox {
+                background: #f8fafc;
+                color: #17202a;
+            }
+            QMessageBox QLabel {
+                background: transparent;
+                color: #17202a;
+                font-size: 13px;
+            }
+            QMessageBox QPushButton {
+                min-width: 92px;
+                background: #e9eef3;
+                color: #17202a;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-weight: 700;
+            }
+            QMessageBox QPushButton:hover {
+                background: #dbe3ea;
+            }
+            QMessageBox QLineEdit,
+            QMessageBox QTextEdit,
+            QMessageBox QPlainTextEdit {
+                background: #ffffff;
+                color: #17202a;
+                border: 1px solid #ccd4dd;
+                border-radius: 8px;
+                padding: 6px 8px;
+            }
             #windowControls {
                 background: transparent;
             }
@@ -2921,7 +3999,34 @@ class PetWindow(QMainWindow):
                 background: #991b1b;
             }
             QCheckBox {
-                padding-left: 6px;
+                color: #0f172a;
+                spacing: 8px;
+                padding: 4px 6px;
+                font-weight: 700;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border: 2px solid #64748b;
+                border-radius: 5px;
+                background: #ffffff;
+            }
+            QCheckBox::indicator:hover {
+                border: 2px solid #2563eb;
+            }
+            QCheckBox::indicator:checked {
+                background: #16697a;
+                border: 2px solid #16697a;
+            }
+            QCheckBox::indicator:checked:hover {
+                background: #0f5260;
+                border: 2px solid #0f5260;
+            }
+            #developerLlmCheck {
+                background: #eef6ff;
+                border: 1px solid #93c5fd;
+                border-radius: 8px;
+                padding: 8px;
             }
             """
         )
@@ -2982,6 +4087,11 @@ class PetWindow(QMainWindow):
             for slot_idx in range(len(self.dev_slot_widgets))
         }
         self.dev_datasets = []
+        display_names = {
+            "spam_binary_test_4source_all.csv": "Clean test · original 4 sources",
+            "spam_binary_test_modern_sources.csv": "Clean test · modern sources",
+            "spam_binary_test_all_sources_latest.csv": "Clean test · ALL sources",
+        }
         for path in _developer_dataset_paths():
             try:
                 summary = _developer_dataset_summary(path)
@@ -2991,22 +4101,8 @@ class PetWindow(QMainWindow):
                 continue
             if "binary_label" not in summary.get("fields", []):
                 continue
+            summary["name"] = display_names.get(path.name, path.name)
             self.dev_datasets.append(summary)
-            if Path(summary.get("path", "")).name == "spam_binary_dataset.csv":
-                self.dev_datasets.append(
-                    _developer_preset_dataset(
-                        summary,
-                        name="spam_binary_dataset.csv [github only]",
-                        preset_sources=["github"],
-                    )
-                )
-                self.dev_datasets.append(
-                    _developer_preset_dataset(
-                        summary,
-                        name="spam_binary_dataset.csv [meajor only]",
-                        preset_sources=["meajor"],
-                    )
-                )
         for slot_idx, widgets in enumerate(self.dev_slot_widgets):
             combo = widgets["dataset_combo"]
             combo.blockSignals(True)
@@ -3036,6 +4132,7 @@ class PetWindow(QMainWindow):
         for slot_idx in range(DEVELOPER_SLOT_COUNT):
             if slot_idx in self.dev_slot_progress_views:
                 self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: Ready")
+        self._developer_refresh_timing_labels()
 
     def _developer_selected_dataset_path(self, slot_idx: int) -> str:
         if not self.dev_slot_widgets:
@@ -3044,6 +4141,129 @@ class PetWindow(QMainWindow):
         if isinstance(data, dict):
             return str(data.get("path") or "")
         return str(data or "")
+
+    def _developer_finished_dashboard_slots(self) -> list[int]:
+        finished_slots: list[int] = []
+        for slot_idx in range(DEVELOPER_SLOT_COUNT):
+            if slot_idx in self.dev_threads:
+                continue
+            timing = self.dev_slot_timing.get(slot_idx) or {}
+            if str(timing.get("state") or "") != "finished":
+                continue
+            metrics = self.dev_slot_metrics.get(slot_idx) or {}
+            if not isinstance(metrics, dict) or int(metrics.get("total") or 0) <= 0:
+                continue
+            finished_slots.append(slot_idx)
+        return finished_slots
+
+    def _update_developer_dashboard_button(self) -> None:
+        button = self.dev_export_dashboard_button
+        if button is None:
+            return
+        finished_count = len(self._developer_finished_dashboard_slots())
+        enabled = 2 <= finished_count <= DEVELOPER_SLOT_COUNT
+        button.setEnabled(enabled)
+        if enabled:
+            button.setText(f"Export Dashboard ({finished_count})")
+            button.setToolTip("Generate a one-page benchmark dashboard image from the finished tests.")
+        else:
+            button.setText("Export Dashboard")
+            button.setToolTip("Finish at least 2 tests before exporting a comparison dashboard.")
+
+    def _developer_dashboard_runs(self) -> list[dict[str, Any]]:
+        runs: list[dict[str, Any]] = []
+        palette = ["#2E86AB", "#F18F01", "#C73E1D", "#6A994E"]
+        for slot_idx in self._developer_finished_dashboard_slots():
+            metrics = dict(self.dev_slot_metrics.get(slot_idx) or {})
+            config = dict(self.dev_last_configs.get(slot_idx) or {})
+            timing = dict(self.dev_slot_timing.get(slot_idx) or {})
+            started_at = timing.get("started_at")
+            finished_at = timing.get("finished_at")
+            if not isinstance(started_at, (int, float)):
+                started_at = None
+            if not isinstance(finished_at, (int, float)):
+                finished_at = None
+            runtime_seconds = 0.0
+            if started_at is not None and finished_at is not None:
+                runtime_seconds = max(0.0, float(finished_at) - float(started_at))
+            elif started_at is not None:
+                runtime_seconds = max(0.0, time.time() - float(started_at))
+            provider = str(config.get("provider") or "")
+            model = str(config.get("model") or "")
+            runs.append(
+                {
+                    "slot_idx": slot_idx,
+                    "name": f"Test{slot_idx + 1}",
+                    "model_label": _developer_dashboard_model_label(provider, model),
+                    "provider": provider,
+                    "model": model,
+                    "color": palette[slot_idx % len(palette)],
+                    "runtime_min": runtime_seconds / 60.0,
+                    "accuracy": float(metrics.get("accuracy") or 0.0),
+                    "fpr": float(metrics.get("fpr") or 0.0),
+                    "recall": float(metrics.get("recall") or 0.0),
+                    "precision": float(metrics.get("precision") or 0.0),
+                    "f1": float(metrics.get("f1") or 0.0),
+                    "llm_used": int(metrics.get("llm_used") or 0),
+                    "llm_applied": int(metrics.get("llm_applied") or 0),
+                    "llm_errors": int(metrics.get("llm_errors") or 0),
+                    "delta_fpr": float(metrics.get("delta_fpr") or 0.0),
+                    "delta_recall": float(metrics.get("delta_recall") or 0.0),
+                    "fp": int(metrics.get("fp") or 0),
+                    "fn": int(metrics.get("fn") or 0),
+                }
+            )
+        return runs
+
+    def export_developer_dashboard(self) -> None:
+        runs = self._developer_dashboard_runs()
+        if len(runs) < 2:
+            QMessageBox.information(
+                self,
+                "Not enough finished tests",
+                "Finish at least 2 tests before exporting a comparison dashboard.",
+            )
+            return
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        out_path = DEVELOPER_RUNS_DIR / f"developer_run_comparison_dashboard_{timestamp}.png"
+        try:
+            saved_path = _developer_export_dashboard_image(runs, out_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed", f"Could not generate the dashboard image.\n\n{exc}")
+            return
+        QMessageBox.information(
+            self,
+            "Dashboard exported",
+            f"Saved comparison dashboard for {len(runs)} finished test(s):\n{saved_path}",
+        )
+
+    def _developer_refresh_timing_labels(self) -> None:
+        now = time.time()
+        for slot_idx in range(DEVELOPER_SLOT_COUNT):
+            progress_widgets = self.dev_slot_progress_views.get(slot_idx)
+            timing = self.dev_slot_timing.get(slot_idx) or {}
+            if not progress_widgets:
+                continue
+            started_at = timing.get("started_at")
+            finished_at = timing.get("finished_at")
+            state = str(timing.get("state") or "idle")
+            if started_at is None:
+                elapsed = 0.0
+            elif finished_at is not None:
+                elapsed = max(0.0, finished_at - started_at)
+            elif state in {"running", "stopping"}:
+                elapsed = max(0.0, now - started_at)
+            else:
+                elapsed = max(0.0, now - started_at)
+            progress_widgets["timing_label"].setText(
+                "Started: "
+                + _format_dev_timestamp(started_at)
+                + "\nFinished: "
+                + _format_dev_timestamp(finished_at)
+                + "\nElapsed: "
+                + _format_dev_duration(elapsed)
+            )
+        self._update_developer_dashboard_button()
 
     def _developer_dataset_changed(self, slot_idx: int, index: int) -> None:
         if index < 0:
@@ -3061,7 +4281,7 @@ class PetWindow(QMainWindow):
         visible_sources = preset_sources or sources
         row_text = f"{item.get('row_count', 0)}+" if item.get("row_count_is_sampled") else str(item.get("row_count", 0))
         widgets["dataset_info"].setText(
-            f"Rows scanned: {row_text}\nSources: {', '.join(visible_sources[:8]) or 'n/a'}\nLabels: {', '.join(labels[:8]) or 'n/a'}"
+            f"Rows: {row_text}\nSources: {', '.join(visible_sources) or 'n/a'}\nLabels: {', '.join(labels) or 'n/a'}"
         )
         widgets["source_list"].clear()
         if not visible_sources:
@@ -3096,14 +4316,19 @@ class PetWindow(QMainWindow):
             return {}
         widgets = self.dev_slot_widgets[slot_idx]
         provider = widgets["model_combo"].currentText().strip()
-        model = widgets["model_input"].text().strip() or _desktop_model_default(provider)
+        model = _model_selector_text(widgets["model_input"]) or _desktop_model_default(provider)
         if resume and slot_idx in self.dev_last_configs:
             config = dict(self.dev_last_configs[slot_idx])
             config["offset"] = int(self.dev_last_completed.get(slot_idx, 0))
             config["limit"] = int(widgets["limit_spin"].value())
             config["sample_mode"] = widgets["sample_mode_combo"].currentText()
+            config["llm_final_review"] = bool(widgets["llm_review_check"].isChecked())
+            config.setdefault("llm_allow_positive_downgrade", True)
+            config.setdefault("llm_allow_positive_refine", True)
+            config.setdefault("llm_allow_normal_upgrade", False)
+            config["run_dir"] = str(_developer_slot_run_dir(slot_idx))
+            config["overwrite_run_dir"] = False
             return config
-        run_id = time.strftime("%Y%m%d-%H%M%S")
         return {
             "dataset_path": dataset_path,
             "sources": self._developer_selected_sources(slot_idx),
@@ -3113,12 +4338,16 @@ class PetWindow(QMainWindow):
             "seed": 42,
             "provider": provider,
             "model": model,
-            "engine": "content_model_ifelse_no_llm_v1",
+            "engine": "content_model_ifelse_llm_guardrail_v2",
             "rspamd_base_url": self.args.base_url,
             "ollama_base_url": self.args.ollama_base_url,
-            "llm_final_review": False,
-            "run_dir": str(DEVELOPER_RUNS_DIR / f"{run_id}-test{slot_idx + 1}"),
-            "runner": "content_model_ifelse_no_llm_v1",
+            "llm_final_review": bool(widgets["llm_review_check"].isChecked()),
+            "llm_allow_positive_downgrade": True,
+            "llm_allow_positive_refine": True,
+            "llm_allow_normal_upgrade": False,
+            "run_dir": str(_developer_slot_run_dir(slot_idx)),
+            "overwrite_run_dir": True,
+            "runner": "content_model_ifelse_llm_guardrail_v2",
         }
 
     def start_developer_experiments(self) -> None:
@@ -3156,6 +4385,7 @@ class PetWindow(QMainWindow):
         self.dev_stop_requested_slots.discard(slot_idx)
         self.dev_pending_restarts.pop(slot_idx, None)
         self.dev_slot_metrics.pop(slot_idx, None)
+        self.dev_slot_timing[slot_idx] = {"started_at": None, "finished_at": None, "state": "idle"}
 
         widgets = self.dev_slot_widgets[slot_idx]
         dataset_combo = widgets["dataset_combo"]
@@ -3164,8 +4394,9 @@ class PetWindow(QMainWindow):
         widgets["dataset_info"].setText("No dataset selected")
         widgets["limit_spin"].setValue(100)
         widgets["sample_mode_combo"].setCurrentText("Balanced 50/50 ham/spam")
+        widgets["llm_review_check"].setChecked(True)
         widgets["model_combo"].setCurrentText(self.args.provider)
-        widgets["model_input"].setText(_desktop_model_default(self.args.provider))
+        _configure_model_selector(widgets["model_input"], self.args.provider, _desktop_model_default(self.args.provider))
 
         progress_widgets = self.dev_slot_progress_views[slot_idx]
         progress_widgets["progress_bar"].setValue(0)
@@ -3173,6 +4404,7 @@ class PetWindow(QMainWindow):
         progress_widgets["log_view"].clear()
         self.dev_slot_metric_views[slot_idx].clear()
         self.dev_chart.set_slot_metrics(self.dev_slot_metrics)
+        self._developer_refresh_timing_labels()
 
     def restart_developer_experiment(self, slot_idx: int) -> None:
         config = self._developer_build_config(slot_idx, resume=False)
@@ -3217,14 +4449,20 @@ class PetWindow(QMainWindow):
         self.dev_stop_requested_slots.discard(slot_idx)
         self.dev_pending_restarts.pop(slot_idx, None)
         self.dev_last_configs[slot_idx] = dict(config)
+        self.dev_slot_timing[slot_idx] = {
+            "started_at": time.time(),
+            "finished_at": None,
+            "state": "running",
+        }
         progress_widgets = self.dev_slot_progress_views[slot_idx]
         progress_widgets["log_view"].clear()
         progress_widgets["progress_bar"].setValue(0)
         progress_widgets["status_label"].setText(f"Test {slot_idx + 1}: Running")
+        self._developer_refresh_timing_labels()
         self._developer_append_log(slot_idx, f"Starting run: {config['run_dir']}")
         self._developer_append_log(
             slot_idx,
-            f"Engine: {config['runner']} (configured model: {config['provider']} / {config['model']}; LLM disabled)",
+            f"Engine: {config['runner']} (configured model: {config['provider']} / {config['model']}; LLM final review={bool(config.get('llm_final_review'))}; normal-upgrade={bool(config.get('llm_allow_normal_upgrade', False))})",
         )
         thread = QThread()
         worker = DeveloperExperimentWorker(config)
@@ -3259,6 +4497,9 @@ class PetWindow(QMainWindow):
         worker.request_stop()
         action = "Restarting" if restart else "Stopping"
         self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: {action}")
+        if slot_idx in self.dev_slot_timing:
+            self.dev_slot_timing[slot_idx]["state"] = "stopping"
+        self._developer_refresh_timing_labels()
         if restart:
             self._developer_append_log(slot_idx, "Restart requested. This test will restart after the current email.")
         else:
@@ -3270,6 +4511,7 @@ class PetWindow(QMainWindow):
         value = int((current / total) * 100) if total else 0
         self.dev_slot_progress_views[slot_idx]["progress_bar"].setValue(value)
         self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: Running {current}/{total}")
+        self._developer_refresh_timing_labels()
 
     def _developer_update_metrics(self, slot_idx: int, metrics: object) -> None:
         if not isinstance(metrics, dict):
@@ -3281,16 +4523,26 @@ class PetWindow(QMainWindow):
         self.dev_chart.set_slot_metrics(self.dev_slot_metrics)
 
     def _developer_finished(self, slot_idx: int, run_dir: str) -> None:
+        if slot_idx in self.dev_slot_timing:
+            self.dev_slot_timing[slot_idx]["finished_at"] = time.time()
         if slot_idx in self.dev_stop_requested_slots:
+            self.dev_slot_timing[slot_idx]["state"] = "stopped"
             self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: Stopped")
             self._developer_append_log(slot_idx, f"Stopped. Partial results saved in {run_dir}")
+            self._developer_refresh_timing_labels()
             return
+        self.dev_slot_timing[slot_idx]["state"] = "finished"
         self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: Finished")
         self._developer_append_log(slot_idx, f"Finished. Saved results in {run_dir}")
+        self._developer_refresh_timing_labels()
 
     def _developer_failed(self, slot_idx: int, message: str) -> None:
+        if slot_idx in self.dev_slot_timing:
+            self.dev_slot_timing[slot_idx]["finished_at"] = time.time()
+            self.dev_slot_timing[slot_idx]["state"] = "failed"
         self.dev_slot_progress_views[slot_idx]["status_label"].setText(f"Test {slot_idx + 1}: Failed")
         self._developer_append_log(slot_idx, f"ERROR: {message}")
+        self._developer_refresh_timing_labels()
 
     def _developer_thread_finished(self, slot_idx: int) -> None:
         thread = self.dev_threads.pop(slot_idx, None)
@@ -3365,7 +4617,7 @@ class PetWindow(QMainWindow):
         if self.args.provider == PUTER_PROVIDER:
             self.progress.clear()
             self.set_progress_state("success")
-            self.append_progress(f"Puter frontend bridge will initialize on the first request for {self.args.model}")
+            self.append_progress(f"ChatGPT will initialize on the first request for {self.args.model}")
             self.set_status("ready", f"Ready: {self.args.provider} / {self.args.model}")
             return
         self._run_agent("", hidden=True, setup_only=True)
@@ -3375,12 +4627,16 @@ class PetWindow(QMainWindow):
         if hasattr(self, "send_button"):
             self.send_button.setEnabled(True)
             self.send_button.setText("Send")
+        if hasattr(self, "chatgpt_login_button"):
+            self.chatgpt_login_button.setVisible(is_puter)
+        if hasattr(self, "chatgpt_logout_button"):
+            self.chatgpt_logout_button.setVisible(is_puter)
         if not hasattr(self, "input"):
             return
         self.input.setReadOnly(False)
         if is_puter:
             self.input.setPlaceholderText(
-                "Ask anything. Puter OpenAI now runs in the same chat UI as the other providers."
+                "Ask anything. ChatGPT runs in the same chat UI as the other providers."
             )
         else:
             self.input.setPlaceholderText("Ask anything, or paste a raw email/header here.")
@@ -3416,7 +4672,7 @@ class PetWindow(QMainWindow):
         )
         if not _wait_for_port("127.0.0.1", PUTER_WEB_PORT, timeout_s=10.0):
             raise RuntimeError(
-                f"Timed out starting the local Puter bridge server on port {PUTER_WEB_PORT}. "
+                f"Timed out starting the local ChatGPT bridge server on port {PUTER_WEB_PORT}. "
                 f"See {PUTER_BRIDGE_LOG} for details."
             )
 
@@ -3445,7 +4701,7 @@ class PetWindow(QMainWindow):
             return
         if self.puter_retry_after_auth and self.puter_bridge is not None and self.puter_pending_messages is not None and self.puter_active_request_id is not None:
             self.puter_retry_after_auth = False
-            self.append_progress("Puter session refreshed. Retrying request.")
+            self.append_progress("ChatGPT session refreshed. Retrying request.")
             self.puter_bridge.submit(self.puter_pending_messages, self.args.model, self.puter_active_request_id)
             return
         if self.developer_puter_retry_after_auth and self.puter_bridge is not None:
@@ -3487,7 +4743,7 @@ class PetWindow(QMainWindow):
         self._ensure_puter_bridge()
 
         window = QMainWindow(self)
-        window.setWindowTitle("Email Guardian · Sign In To Puter")
+        window.setWindowTitle("Email Guardian · 登录 ChatGPT")
         view = QWebEngineView(window)
 
         controller = self
@@ -3497,7 +4753,7 @@ class PetWindow(QMainWindow):
             def createWindow(self, window_type):  # type: ignore[override]
                 del window_type
                 popup_window = QMainWindow()
-                popup_window.setWindowTitle("Puter Sign In")
+                popup_window.setWindowTitle("登录 ChatGPT")
                 popup_view = QWebEngineView(popup_window)
                 popup_page = QWebEnginePage(controller.puter_profile, popup_view)
                 popup_view.setPage(popup_page)
@@ -3531,7 +4787,7 @@ class PetWindow(QMainWindow):
                 elif auth_type == "success":
                     controller.puter_auth_success_signal.emit()
                 elif auth_type == "error":
-                    controller.puter_auth_failure_signal.emit(auth_message or "Puter sign-in failed")
+                    controller.puter_auth_failure_signal.emit(auth_message or "ChatGPT login failed")
 
         page = _AuthPage(self.puter_profile, view)
         page.settings().setAttribute(
@@ -3545,27 +4801,66 @@ class PetWindow(QMainWindow):
         self.puter_auth_window = window
         self.puter_auth_view = view
 
+    def login_chatgpt(self) -> None:
+        if self.provider_combo.currentText().strip() != PUTER_PROVIDER:
+            return
+        self._ensure_puter_auth_window()
+        if self.puter_auth_window is not None:
+            self.puter_auth_window.show()
+            self.puter_auth_window.raise_()
+            self.puter_auth_window.activateWindow()
+        self.set_progress_state("busy")
+        self.append_progress("Opening ChatGPT login window.")
+
+    def logout_chatgpt(self) -> None:
+        if self.provider_combo.currentText().strip() != PUTER_PROVIDER:
+            return
+        self.puter_history = []
+        self.puter_pending_messages = None
+        self.puter_active_request_id = None
+        self.puter_retry_after_auth = False
+        self.developer_puter_auth_retry_ids.clear()
+        self.developer_puter_retry_after_auth = False
+        if self.puter_bridge is not None:
+            self.puter_bridge.sign_out()
+        if self.puter_profile is not None:
+            try:
+                self.puter_profile.cookieStore().deleteAllCookies()
+                self.puter_profile.clearHttpCache()
+                self.puter_profile.clearAllVisitedLinks()
+            except Exception:
+                pass
+        if self.puter_auth_view is not None:
+            from PySide6.QtCore import QUrl
+
+            self.puter_auth_view.load(QUrl(self._puter_auth_url()))
+        if self.puter_bridge is not None:
+            self.puter_bridge.reload()
+        self.set_progress_state("success")
+        self.append_progress("ChatGPT login has been cleared. Use 登录 ChatGPT to sign in again.")
+        self.set_status("ready", f"Ready: {self.args.provider} / {self.args.model}")
+
     def _puter_bridge_auth_required(self, request_id: int, message: str) -> None:
         if request_id != self.puter_active_request_id:
             return
         self.puter_auth_in_progress = True
         self.set_progress_state("busy")
-        self.set_status("starting", "Puter sign-in required")
+        self.set_status("starting", "ChatGPT login required")
         self.append_progress(message)
-        self.append_progress("A one-time Puter sign-in window is opening. Complete it, then the message will retry automatically.")
+        self.append_progress("A ChatGPT login window is opening. Complete it, then the message will retry automatically.")
         self._ensure_puter_auth_window()
         self.puter_auth_window.show()
         self.puter_auth_window.raise_()
         self.puter_auth_window.activateWindow()
 
     def _on_puter_auth_window_ready(self) -> None:
-        self.append_progress("Puter sign-in window is ready")
+        self.append_progress("ChatGPT login window is ready")
 
     def _puter_auth_succeeded(self) -> None:
         self.puter_auth_in_progress = False
         if self.puter_auth_window is not None:
             self.puter_auth_window.hide()
-        self.append_progress("Puter sign-in completed. Refreshing session before retry.")
+        self.append_progress("ChatGPT login completed. Refreshing session before retry.")
         if self.developer_puter_auth_retry_ids and self.puter_bridge is not None:
             self.developer_puter_retry_after_auth = True
             self.puter_bridge.reload()
@@ -3676,16 +4971,7 @@ class PetWindow(QMainWindow):
     def _developer_puter_bridge_completed(self, request_id: int, text: str) -> None:
         if request_id not in self.developer_puter_requests:
             return
-        verdict, rationale = _developer_parse_llm_verdict(text)
-        self._complete_developer_puter_request(
-            request_id,
-            {
-                "ok": verdict in {"Normal", "Spam", "Phishing"},
-                "verdict": verdict,
-                "reason": rationale,
-                "raw_text": text,
-            },
-        )
+        self._complete_developer_puter_request(request_id, _developer_parse_llm_review(text))
 
     def _developer_puter_bridge_failed(self, request_id: int, message: str) -> None:
         if request_id == 0:
@@ -3732,7 +5018,7 @@ class PetWindow(QMainWindow):
                 {
                     "ok": False,
                     "verdict": None,
-                    "reason": message or "Puter sign-in required before developer final review can run.",
+                    "reason": message or "ChatGPT login required before developer final review can run.",
                     "raw_text": "",
                 },
             )
@@ -3747,7 +5033,7 @@ class PetWindow(QMainWindow):
         initial_progress: list[str] | None = None,
     ) -> None:
         if self.puter_active_request_id is not None:
-            QMessageBox.information(self, "Busy", "Puter OpenAI is still working on the current request.")
+            QMessageBox.information(self, "Busy", "ChatGPT is still working on the current request.")
             return
 
         self.set_status("busy", "Working")
@@ -3758,7 +5044,7 @@ class PetWindow(QMainWindow):
         self.set_progress_state("busy")
         for line in initial_progress or []:
             self.append_progress(line)
-        self.append_progress(f"Preparing Puter OpenAI ({self.args.model})")
+        self.append_progress(f"Preparing ChatGPT ({self.args.model})")
         QApplication.processEvents()
 
         try:
@@ -3774,11 +5060,11 @@ class PetWindow(QMainWindow):
             if bridge.is_ready:
                 self._puter_bridge_ready()
             else:
-                self.append_progress("Waiting for Puter bridge to finish loading")
+                self.append_progress("Waiting for ChatGPT to finish loading")
             self.send_button.setEnabled(True)
             return
 
-        self.append_progress(f"Calling Puter OpenAI ({self.args.model})")
+        self.append_progress(f"Calling ChatGPT ({self.args.model})")
         QApplication.processEvents()
 
         request_id = self.puter_next_request_id
@@ -4148,7 +5434,7 @@ class PetWindow(QMainWindow):
             self.set_status("ready", f"Ready: {self.args.provider} / {self.args.model}")
 
     def update_model_default(self, provider: str) -> None:
-        self.model_input.setText(_desktop_model_default(provider))
+        _configure_model_selector(self.model_input, provider, _desktop_model_default(provider))
         self._sync_provider_ui(provider)
 
     def switch_model(self) -> None:
@@ -4157,9 +5443,9 @@ class PetWindow(QMainWindow):
             return
 
         provider = self.provider_combo.currentText().strip()
-        model = self.model_input.text().strip()
-        if provider not in {"gemini", "ollama", PUTER_PROVIDER}:
-            QMessageBox.warning(self, "Invalid provider", "Choose gemini, ollama, or puter-openai.")
+        model = _model_selector_text(self.model_input)
+        if provider not in {"gemini", "ollama", TOKENROUTER_PROVIDER, PUTER_PROVIDER}:
+            QMessageBox.warning(self, "Invalid provider", "Choose gemini, ollama, tokenrouter, or puter-openai.")
             return
         if not model:
             QMessageBox.warning(self, "Missing model", "Enter a model name before switching.")
@@ -4201,14 +5487,15 @@ class PetWindow(QMainWindow):
             except Exception as exc:
                 QMessageBox.warning(self, "Could not fetch original email", str(exc))
                 return
+            direct_referenced_emails = referenced_emails
             prompt_to_send = build_referenced_email_prompt(prompt, referenced_emails)
             prefer_ai_response = len(self.referenced_emails) > 1
-            direct_referenced_emails = referenced_emails
             self.clear_referenced_email()
         elif _looks_like_raw_email_input(prompt):
-            direct_referenced_emails = [_email_item_from_raw_text(prompt)]
+            pasted_email = [_email_item_from_raw_text(prompt)]
             initial_progress = ["Using pasted email content as raw email input"]
-            prompt_to_send = build_referenced_email_prompt("Analyze the pasted email", direct_referenced_emails)
+            direct_referenced_emails = pasted_email
+            prompt_to_send = build_referenced_email_prompt("Analyze the pasted email", pasted_email)
         self._run_agent(
             prompt_to_send,
             display_prompt=prompt,
@@ -4454,9 +5741,9 @@ class PetWindow(QMainWindow):
 def parse_args() -> argparse.Namespace:
     load_local_env(PROJECT_ROOT)
     env_provider = (os.getenv("LLM_PROVIDER") or "").strip().lower()
-    default_provider = env_provider if env_provider == PUTER_PROVIDER else resolve_provider()
+    default_provider = env_provider if env_provider in {PUTER_PROVIDER, TOKENROUTER_PROVIDER} else resolve_provider()
     parser = argparse.ArgumentParser(description="Run Email Guardian as a desktop pet.")
-    parser.add_argument("--provider", default=default_provider, choices=["ollama", "gemini", PUTER_PROVIDER])
+    parser.add_argument("--provider", default=default_provider, choices=["ollama", "gemini", TOKENROUTER_PROVIDER, PUTER_PROVIDER])
     parser.add_argument("--model", default=_desktop_model_default(default_provider))
     parser.add_argument("--ollama-base-url", default=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"))
     parser.add_argument("--base-url", default=os.getenv("RSPAMD_BASE_URL", "http://127.0.0.1:11333"))

@@ -33,7 +33,7 @@ from model_factory import resolve_default_model, resolve_provider
 def parse_args() -> argparse.Namespace:
     default_provider = resolve_provider()
     parser = argparse.ArgumentParser(description="Run the Email Guardian chatbot in the terminal.")
-    parser.add_argument("--provider", default=default_provider, choices=["ollama", "gemini"])
+    parser.add_argument("--provider", default=default_provider, choices=["ollama", "gemini", "tokenrouter"])
     parser.add_argument("--model", default=resolve_default_model(default_provider))
     parser.add_argument("--ollama-base-url", default="http://127.0.0.1:11434")
     parser.add_argument("--base-url", default="http://127.0.0.1:11333")

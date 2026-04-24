@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Puter Sign In</title>
+  <title>ChatGPT Login</title>
   <style>
     body {
       margin: 0;
@@ -56,11 +56,11 @@
 </head>
 <body>
   <div class="card">
-    <h1>Sign In To Puter</h1>
-    <p>This is a one-time sign-in so the desktop chat can use Puter's frontend free model access in the same chat UI.</p>
-    <p>After sign-in finishes, this window will close and your last message will retry automatically.</p>
-    <button id="sign-in">Continue With Puter</button>
-    <div id="status">Loading Puter SDK...</div>
+    <h1>登录 ChatGPT</h1>
+    <p>登录后，桌面聊天窗口会使用当前账号继续请求模型。</p>
+    <p>登录完成后，这个窗口会关闭，上一条消息会自动重试。</p>
+    <button id="sign-in">登录 ChatGPT</button>
+    <div id="status">正在加载登录组件...</div>
   </div>
 
   <script src="https://js.puter.com/v2/"></script>
@@ -82,26 +82,26 @@
         }
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
-      statusEl.textContent = "Timed out waiting for Puter SDK.";
-      emit({ type: "error", message: "Timed out waiting for Puter sign-in page to load." });
+      statusEl.textContent = "登录组件加载超时。";
+      emit({ type: "error", message: "Timed out waiting for ChatGPT login page to load." });
     }
 
     document.getElementById("sign-in").addEventListener("click", async () => {
       try {
-        statusEl.textContent = "Opening Puter sign-in...";
+        statusEl.textContent = "正在打开登录窗口...";
         await window.puter.auth.signIn({ attempt_temp_user_creation: true });
         const deadline = Date.now() + 10000;
         while (Date.now() < deadline) {
           if (typeof window.puter.auth.isSignedIn === "function" && window.puter.auth.isSignedIn()) {
-            statusEl.textContent = "Sign-in complete.";
+            statusEl.textContent = "登录完成。";
             emit({ type: "success" });
             return;
           }
           await new Promise((resolve) => setTimeout(resolve, 200));
         }
-        throw new Error("Puter sign-in did not persist in this session.");
+        throw new Error("ChatGPT login did not persist in this session.");
       } catch (error) {
-        statusEl.textContent = "Sign-in failed.";
+        statusEl.textContent = "登录失败。";
         emit({
           type: "error",
           message: error && error.message ? error.message : String(error),

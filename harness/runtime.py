@@ -41,6 +41,31 @@ def render_content(content: object) -> str:
     return str(content)
 
 
+def _looks_like_general_chat(prompt: str) -> bool:
+    lowered = prompt.lower()
+    email_terms = (
+        "email",
+        "mailbox",
+        "inbox",
+        "headers",
+        "phishing",
+        "spam",
+        "rfc822",
+        "imap",
+        "dkim",
+        "dmarc",
+        "spf",
+        "raw email",
+        "邮件",
+        "邮箱",
+        "收件箱",
+        "钓鱼",
+        "垃圾邮件",
+        "邮件头",
+    )
+    return not any(term in lowered for term in email_terms)
+
+
 def parse_tool_payload(message: ToolMessage) -> object:
     raw = render_content(message.content).strip()
     if not raw:
@@ -461,11 +486,21 @@ class _BaseRuntime:
         self.persona = persona
         self.show_messages = show_messages
         self.router = EmailAgentRouter()
+        self.model = None
         self.agent = None
-        self.system_prompt = build_system_prompt(persona)
+        self.system_prompt = "\n".join(
+            [
+                build_system_prompt(persona),
+                "",
+                "Runtime context:",
+                f"- Active provider: {provider}",
+                f"- Active model: {model_name}",
+                "- If the user asks what model or provider is currently answering, use this runtime context directly.",
+            ]
+        )
 
     async def setup(self) -> None:
-        model = build_chat_model(
+        self.model = build_chat_model(
             provider=self.provider,
             model_name=self.model_name,
             temperature=0,
@@ -482,7 +517,7 @@ class _BaseRuntime:
         }
         client = MultiServerMCPClient(server_config)
         tools = await client.get_tools()
-        self.agent = create_react_agent(model=model, tools=tools)
+        self.agent = create_react_agent(model=self.model, tools=tools)
 
     def routed_hint(self, prompt: str, limit: int = 3) -> str:
         matches = self.router.route(prompt, limit=limit)
@@ -538,6 +573,55 @@ class _BaseRuntime:
         rendered = ", ".join(names[: max(limit + 2, len(names))])
         return f"Routing hints: {rendered}"
 
+    def _chat_content(self, prompt: str, hint: str) -> str:
+        if hint:
+            return f"{hint}\n\n{prompt}"
+        general_directive = (
+            "General chat request. Do not call MCP tools. Answer the user directly in the same language as the question, "
+            "briefly and naturally."
+        )
+        if self.provider == "ollama" and "qwen" in self.model_name.lower():
+            return f"/no_think\n{general_directive}\n\nUser question:\n{prompt}"
+        return f"{general_directive}\n\nUser question:\n{prompt}"
+
+    async def _invoke_direct_chat(
+        self,
+        latest_messages: list[BaseMessage],
+        *,
+        prompt: str,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> AIMessage:
+        if self.model is None:
+            raise RuntimeError("Model has not been initialized")
+        try:
+            response = await self.model.ainvoke(latest_messages)
+            ai_message = response if isinstance(response, AIMessage) else AIMessage(content=render_content(getattr(response, "content", response)))
+            if render_content(ai_message.content).strip():
+                return ai_message
+        except Exception as exc:
+            first_error = exc
+        else:
+            first_error = RuntimeError("model returned empty content")
+
+        if progress_callback:
+            progress_callback("Retrying direct answer")
+        retry_prompt = (
+            "Answer this user question directly. Do not use tools. Do not explain your chain of thought. "
+            "Keep the answer short and natural, and answer in the same language as the user.\n\n"
+            f"User question:\n{prompt}"
+        )
+        if self.provider == "ollama" and "qwen" in self.model_name.lower():
+            retry_prompt = f"/no_think\n{retry_prompt}"
+        retry_messages = [SystemMessage(content=self.system_prompt), HumanMessage(content=retry_prompt)]
+        try:
+            response = await self.model.ainvoke(retry_messages)
+        except Exception:
+            raise first_error
+        ai_message = response if isinstance(response, AIMessage) else AIMessage(content=render_content(getattr(response, "content", response)))
+        if render_content(ai_message.content).strip():
+            return ai_message
+        raise first_error
+
 
 class EmailAgentRuntime(_BaseRuntime):
     def __init__(
@@ -568,17 +652,35 @@ class EmailAgentRuntime(_BaseRuntime):
         *,
         progress_callback: Callable[[str], None] | None = None,
     ) -> tuple[list[BaseMessage], int]:
-        if self.agent is None:
+        if self.agent is None or self.model is None:
             raise RuntimeError("Agent has not been initialized")
         start_idx = len(self.history)
         hint = self.routed_hint(prompt)
-        content = f"{hint}\n\n{prompt}" if hint else prompt
+        content = self._chat_content(prompt, hint)
         latest_messages = [*self.history, HumanMessage(content=content)]
         emitted_count = len(self.history)
         if progress_callback:
             if hint:
                 progress_callback(f"Routing: {hint.removeprefix('Routing hints:').strip()}")
             progress_callback("Thinking...")
+        if not hint or _looks_like_general_chat(prompt):
+            try:
+                response = await self._invoke_direct_chat(
+                    latest_messages,
+                    prompt=prompt,
+                    progress_callback=progress_callback,
+                )
+            except Exception:
+                self.history = latest_messages
+                raise
+            latest_messages = [
+                *latest_messages,
+                response,
+            ]
+            self.history = latest_messages
+            if progress_callback:
+                progress_callback("Preparing the final answer")
+            return latest_messages, start_idx
         try:
             async for state in self.agent.astream({"messages": latest_messages}, stream_mode="values"):
                 if isinstance(state, dict) and isinstance(state.get("messages"), list):
@@ -655,7 +757,7 @@ class SingleTurnAgentRuntime(_BaseRuntime):
         if self.agent is None:
             raise RuntimeError("Agent has not been initialized")
         hint = self.routed_hint(prompt)
-        content = f"{hint}\n\n{prompt}" if hint else prompt
+        content = self._chat_content(prompt, hint)
         return await self.agent.ainvoke(
             {"messages": [SystemMessage(content=self.system_prompt), HumanMessage(content=content)]}
         )

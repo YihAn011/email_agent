@@ -70,10 +70,6 @@ def _heuristic_score(payload: ContentModelCheckInput) -> float:
         "bonus deposit",
         "pills",
         "pharmacy",
-        "unsubscribe",
-        "free",
-        "guarantee",
-        "limited time",
         "opportunity",
     )
     hit_count = sum(1 for term in spam_terms if term in text)
@@ -82,6 +78,39 @@ def _heuristic_score(payload: ContentModelCheckInput) -> float:
     score += min(0.1, text.count("!") * 0.01)
     if "escapenumber" in text or "escapelong" in text:
         score += 0.25
+    marketing_markers = sum(
+        1
+        for token in (
+            "unsubscribe",
+            "list-unsubscribe",
+            "privacy",
+            "view online",
+            "manage preferences",
+            "download the app",
+            "book now",
+            "shop deals",
+            "save ",
+            "offer",
+            "newsletter",
+            "overview",
+        )
+        if token in text
+    )
+    if marketing_markers >= 2 and not any(
+        token in text
+        for token in (
+            "verify",
+            "verification",
+            "password",
+            "login",
+            "security alert",
+            "gift card",
+            "bitcoin",
+            "cryptocurrency",
+            "wallet",
+        )
+    ):
+        score = min(score, 0.3)
     return min(0.99, score)
 
 
@@ -159,4 +188,3 @@ class ContentModelCheckSkill(BaseSkill[ContentModelCheckInput, ContentModelCheck
                     timestamp_utc=timestamp_utc,
                 ),
             )
-

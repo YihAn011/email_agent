@@ -69,6 +69,8 @@ def build_system_prompt(persona: str) -> str:
         "- If the user provides HTML email content or an email template and asks to check/analyze the email, do not summarize the HTML structure. Treat it as email content, run the email security tools, and return the verdict template.",
         "",
         "Response requirements:",
+        "- If the user asks a general non-email question, answer directly in natural language and do not call tools.",
+        "- If the user asks about the active model/provider, answer from the current chat context if known; do not call email security tools.",
         "- Use this short output template for single-email checks:",
         "  Email: <email subject or short name>",
         "  Type: <business/school/recruiting/financial/account security/delivery/marketing/general notification/etc.>",

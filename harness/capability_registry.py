@@ -73,7 +73,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         kind="tool",
         source_hint="mcp_server.py / skills/imap_monitor/skill.py",
         responsibility="List locally saved IMAP mailbox bindings before asking the user for credentials again.",
-        trigger_terms=("my inbox", "my email", "my mailbox", "recent emails", "bound mailbox", "我的邮箱", "我的收件箱", "最近邮件"),
+        trigger_terms=("my inbox", "my email", "my mailbox", "recent emails", "bound mailbox", "我的邮箱", "我邮箱", "我的收件箱", "邮箱里", "最近邮件"),
     ),
     Capability(
         name="bind_imap_mailbox",
@@ -154,7 +154,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         kind="tool",
         source_hint="mcp_server.py / skills/imap_monitor/skill.py",
         responsibility="Fetch and analyze the latest N emails from a bound mailbox on demand.",
-        trigger_terms=("recent emails", "latest emails", "newest emails", "my inbox", "phishing emails", "最近邮件", "最新邮件", "钓鱼邮件"),
+        trigger_terms=("recent emails", "latest emails", "newest emails", "my inbox", "phishing emails", "最近邮件", "最新邮件", "前5个邮件", "前五个邮件", "邮箱里", "钓鱼邮件"),
         nested_tools=("rspamd_scan_email", "email_header_auth_check"),
         requires_bound_mailbox=True,
     ),

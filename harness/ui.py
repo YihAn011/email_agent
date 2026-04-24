@@ -6,6 +6,8 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
+from skills.decision_policy import required_decision_label as _shared_required_decision_label
+
 from .runtime import latest_ai_message, parse_tool_payload, summarize_invoked_tools
 
 
@@ -106,6 +108,18 @@ def _required_decision_label(
     subject: str = "",
     from_address: str = "",
 ) -> str:
+    return _shared_required_decision_label(
+        rspamd_data,
+        content_data,
+        header_data,
+        url_data,
+        urgency_data,
+        scam_data,
+        spam_data,
+        subject,
+        from_address,
+    )
+
     categories = {str(item).lower() for item in (rspamd_data.get("categories") or [])}
     symbols = {
         str(item.get("name") or "").lower()

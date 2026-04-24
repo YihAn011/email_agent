@@ -13,6 +13,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from skills.content_model.schemas import ContentModelCheckInput
+from skills.content_model.skill import ContentModelCheckSkill
 from skills.header_auth.schemas import EmailHeaderAuthCheckInput
 from skills.header_auth.skill import EmailHeaderAuthCheckSkill
 from skills.imap_monitor.skill import (
@@ -62,6 +64,7 @@ def evaluate_row(
     url_skill: UrlReputationSkill,
     scam_skill: ScamIndicatorCheckSkill,
     spam_skill: SpamCampaignCheckSkill,
+    content_skill: ContentModelCheckSkill,
 ) -> dict[str, object]:
     raw_email = build_raw_email(row)
     rspamd_result = rspamd_skill.run(
@@ -69,6 +72,15 @@ def evaluate_row(
     )
     header_result = header_skill.run(
         EmailHeaderAuthCheckInput(raw_email=raw_email, include_raw_headers=False)
+    )
+    content_result = content_skill.run(
+        ContentModelCheckInput(
+            email_text=row.get("email_text", ""),
+            subject=row.get("subject", ""),
+            from_address=row.get("sender", ""),
+            sender_domain=row.get("sender_domain", ""),
+            content_types=row.get("content_types", ""),
+        )
     )
     urgency_result = urgency_skill.run(
         UrgencyCheckInput(subject=row.get("subject", ""), email_text=row.get("email_text", ""))
@@ -106,6 +118,7 @@ def evaluate_row(
     predicted_verdict, summary = _compose_final_verdict(
         rspamd_result,
         header_result,
+        content_result,
         urgency_result,
         url_result,
         scam_result,
@@ -157,6 +170,10 @@ def evaluate_row(
         "rspamd_action": rspamd_result.data.action if rspamd_result.ok and rspamd_result.data else None,
         "header_ok": header_result.ok,
         "header_risk_level": header_result.data.risk_level if header_result.ok and header_result.data else None,
+        "content_ok": content_result.ok,
+        "content_risk_level": content_result.data.risk_level if content_result.ok and content_result.data else None,
+        "content_score": content_result.data.malicious_score if content_result.ok and content_result.data else None,
+        "content_threshold": content_result.data.threshold if content_result.ok and content_result.data else None,
         "urgency_ok": urgency_result.ok,
         "urgency_label": urgency_result.data.urgency_label if urgency_result.ok and urgency_result.data else None,
         "urgency_score": urgency_result.data.urgency_score if urgency_result.ok and urgency_result.data else None,
@@ -208,6 +225,7 @@ def main() -> None:
     url_skill = UrlReputationSkill()
     scam_skill = ScamIndicatorCheckSkill()
     spam_skill = SpamCampaignCheckSkill()
+    content_skill = ContentModelCheckSkill()
 
     processed = 0
     with input_path.open(newline="", encoding="utf-8", errors="ignore") as handle, output_path.open(
@@ -227,6 +245,7 @@ def main() -> None:
                 url_skill=url_skill,
                 scam_skill=scam_skill,
                 spam_skill=spam_skill,
+                content_skill=content_skill,
             )
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
             out.flush()

@@ -58,3 +58,6 @@ dataset/processed/*.jsonl
 dataset/processed/*.md
 dataset/reports/
 dataset/upstream_repo/
+
+# Local upload bundles / presentation artifacts
+email_agent_chatgpt_upload_*.zip

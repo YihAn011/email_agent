@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import html
 import re
 from datetime import datetime, timezone
+from email import policy
+from email.parser import BytesParser
 from time import perf_counter
 
 from skills.base_skill import BaseSkill, SkillError, SkillMeta, SkillResult
@@ -21,6 +24,51 @@ def _add(
         reasons.append(reason)
 
 
+def _compact_text(text: str) -> str:
+    text = html.unescape(text or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _readable_email_text(raw_email: str) -> tuple[str, str]:
+    reply_to = ""
+    body_parts: list[str] = []
+    try:
+        msg = BytesParser(policy=policy.default).parsebytes(raw_email.encode("utf-8", errors="replace"))
+        reply_to = str(msg.get("Reply-To") or "")
+        subject = str(msg.get("Subject") or "")
+        from_address = str(msg.get("From") or "")
+        if subject:
+            body_parts.append(subject)
+        if from_address:
+            body_parts.append(from_address)
+        if reply_to:
+            body_parts.append(reply_to)
+        for part in msg.walk():
+            if part.is_multipart():
+                continue
+            content_type = (part.get_content_type() or "").lower()
+            if content_type not in {"text/plain", "text/html"}:
+                continue
+            try:
+                payload = part.get_content()
+            except Exception:
+                try:
+                    payload = part.get_payload(decode=True).decode(
+                        part.get_content_charset() or "utf-8",
+                        errors="replace",
+                    )
+                except Exception:
+                    payload = ""
+            if not isinstance(payload, str):
+                payload = str(payload)
+            body_parts.append(_compact_text(payload))
+    except Exception:
+        body_parts.append(_compact_text(raw_email))
+    return " ".join(part for part in body_parts if part), reply_to
+
+
 class ScamIndicatorCheckSkill(BaseSkill[ScamIndicatorCheckInput, ScamIndicatorCheckResult]):
     name = "scam_indicator_check"
     description = (
@@ -36,7 +84,17 @@ class ScamIndicatorCheckSkill(BaseSkill[ScamIndicatorCheckInput, ScamIndicatorCh
 
         try:
             from_address = payload.from_address or ""
-            text = f"{payload.subject}\n{from_address}\n{payload.raw_email}".lower()
+            readable_text, reply_to = _readable_email_text(payload.raw_email or "")
+            text = " ".join(
+                part
+                for part in (
+                    payload.subject or "",
+                    from_address,
+                    reply_to,
+                    readable_text,
+                )
+                if part
+            ).lower()
             reasons: list[str] = []
             indicators: list[str] = []
 
@@ -84,8 +142,8 @@ class ScamIndicatorCheckSkill(BaseSkill[ScamIndicatorCheckInput, ScamIndicatorCh
                 )
 
             official_claim = any(brand in text for brand in ("paypal", "microsoft", "apple", "irs", "fbi", "bank"))
-            free_mail_reply = "reply-to:" in text and any(
-                domain in text for domain in ("gmail.com", "yahoo.com", "outlook.com", "hotmail.com")
+            free_mail_reply = any(
+                domain in reply_to.lower() for domain in ("gmail.com", "yahoo.com", "outlook.com", "hotmail.com")
             )
             if official_claim and free_mail_reply:
                 _add(
@@ -95,7 +153,22 @@ class ScamIndicatorCheckSkill(BaseSkill[ScamIndicatorCheckInput, ScamIndicatorCh
                     reason="The reply address is a free-mail account while the message claims to be from an official organization.",
                 )
 
-            if any(token in text for token in ("gift card", "amazon gift card", "bitcoin", "btc", "wallet:")):
+            gift_card_scam = (
+                ("gift card" in text or "amazon gift card" in text)
+                and any(
+                    phrase in text
+                    for phrase in (
+                        "buy gift card",
+                        "purchase gift card",
+                        "pay with gift card",
+                        "send gift card",
+                        "gift card payment",
+                        "gift cards as payment",
+                    )
+                )
+            )
+            crypto_scam = any(token in text for token in ("bitcoin", "btc", "wallet:"))
+            if gift_card_scam or crypto_scam:
                 _add(
                     reasons=reasons,
                     indicators=indicators,
@@ -108,7 +181,6 @@ class ScamIndicatorCheckSkill(BaseSkill[ScamIndicatorCheckInput, ScamIndicatorCh
                 for token in (
                     "we remotely watch",
                     "we have screenshot",
-                    "camera",
                     "child porno",
                     "call police",
                     "fbi arrest",

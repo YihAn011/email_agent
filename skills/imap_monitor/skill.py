@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import imaplib
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -9,11 +10,15 @@ import time
 from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
+from html.parser import HTMLParser
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 from skills.base_skill import BaseSkill, SkillError, SkillMeta, SkillResult
+from skills.decision_policy import required_decision_label
+from skills.content_model.schemas import ContentModelCheckInput
+from skills.content_model.skill import ContentModelCheckSkill
 from skills.error_patterns.schemas import ErrorPatternMemoryCheckInput, ListErrorPatternsInput
 from skills.error_patterns.skill import ErrorPatternMemoryCheckSkill, ListErrorPatternsSkill
 from skills.header_auth.schemas import EmailHeaderAuthCheckInput
@@ -146,9 +151,94 @@ def _get_all_uids(client: imaplib.IMAP4) -> list[int]:
     return _parse_uids(search_data)
 
 
+class _ReadableTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self.parts.append(data)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag.lower() in {"br", "p", "div", "li", "tr", "td", "th"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"p", "div", "li", "tr"}:
+            self.parts.append("\n")
+
+    @property
+    def text(self) -> str:
+        return "".join(self.parts)
+
+
+def _clean_mail_text(text: str) -> str:
+    text = text.replace("\r", "\n")
+    text = re.sub(r"[\t\x0b\x0c ]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _looks_like_html(text: str) -> bool:
+    lowered = (text or "").lower()
+    return "<html" in lowered or "<body" in lowered or "<table" in lowered or "</div>" in lowered
+
+
+def _html_to_text(raw_html: str) -> str:
+    parser = _ReadableTextExtractor()
+    try:
+        parser.feed(raw_html)
+        parser.close()
+    except Exception:
+        return ""
+    return _clean_mail_text(parser.text)
+
+
+def _part_text(part) -> str:
+    try:
+        content = part.get_content()
+    except Exception:
+        payload = part.get_payload(decode=True) or b""
+        if isinstance(payload, bytes):
+            content = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+        else:
+            content = str(payload)
+    return str(content)
+
+
+def _mail_body_text(raw_bytes: bytes) -> str:
+    parsed = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+    plain_body = parsed.get_body(preferencelist=("plain",))
+    if plain_body is not None:
+        text = _part_text(plain_body).strip()
+        if text:
+            if _looks_like_html(text):
+                readable = _html_to_text(text)
+                if readable:
+                    return readable
+            return _clean_mail_text(text)
+    html_body = parsed.get_body(preferencelist=("html",))
+    if html_body is not None:
+        text = _html_to_text(_part_text(html_body))
+        if text:
+            return text
+    payload = parsed.get_payload(decode=True) or b""
+    if isinstance(payload, bytes):
+        text = payload.decode(parsed.get_content_charset() or "utf-8", errors="replace")
+    else:
+        text = str(payload)
+    if _looks_like_html(text):
+        readable = _html_to_text(text)
+        if readable:
+            return readable
+    return _clean_mail_text(text)
+
 def _compose_final_verdict(
     rspamd_result: SkillResult[Any],
     header_result: SkillResult[Any],
+    content_result: SkillResult[Any] | None = None,
     urgency_result: SkillResult[Any] | None = None,
     url_result: SkillResult[Any] | None = None,
     scam_result: SkillResult[Any] | None = None,
@@ -157,174 +247,67 @@ def _compose_final_verdict(
     subject: str = "",
     from_address: str = "",
 ) -> tuple[str, str]:
-    if not rspamd_result.ok and not header_result.ok:
-        return "error", "Both rspamd_scan_email and email_header_auth_check failed."
+    if not rspamd_result.ok and not header_result.ok and not (content_result and content_result.ok):
+        return "error", "Core email detectors failed."
 
-    verdict = "benign"
-    reasons: list[str] = []
+    rspamd_data = rspamd_result.data.model_dump() if rspamd_result.ok and rspamd_result.data else {}
+    header_data = header_result.data.model_dump() if header_result.ok and header_result.data else None
+    content_data = content_result.data.model_dump() if content_result and content_result.ok and content_result.data else None
+    urgency_data = urgency_result.data.model_dump() if urgency_result and urgency_result.ok and urgency_result.data else None
+    url_data = url_result.data.model_dump() if url_result and url_result.ok and url_result.data else None
+    scam_data = scam_result.data.model_dump() if scam_result and scam_result.ok and scam_result.data else None
+    spam_data = spam_result.data.model_dump() if spam_result and spam_result.ok and spam_result.data else None
 
-    rspamd_data = rspamd_result.data
-    header_data = header_result.data
-    urgency_data = urgency_result.data if urgency_result and urgency_result.ok else None
-    url_data = url_result.data if url_result and url_result.ok else None
-    scam_data = scam_result.data if scam_result and scam_result.ok else None
-    spam_data = spam_result.data if spam_result and spam_result.ok else None
-
-    categories: set[str] = set()
-    symbol_names: set[str] = set()
-    rspamd_action = ""
-    rspamd_score = 0.0
-    header_findings: set[str] = set()
-    explicit_auth_failure = False
-    has_high_header_finding = False
-    has_medium_header_finding = False
-
-    sender_text = f"{subject} {from_address}".lower()
-    branded_marketing = any(
-        token in sender_text
-        for token in (
-            "subway",
-            "subs.subway.com",
-            "news@subs.subway.com",
-        )
+    decision = required_decision_label(
+        rspamd_data,
+        content_data,
+        header_data,
+        url_data,
+        urgency_data,
+        scam_data,
+        spam_data,
+        subject,
+        from_address,
     )
+    verdict = {
+        "Normal": "benign",
+        "Spam": "suspicious",
+        "Phishing": "phishing_or_spoofing",
+    }.get(decision, "benign")
 
-    if rspamd_result.ok and rspamd_data is not None:
-        categories = {item.lower() for item in rspamd_data.categories}
-        symbol_names = {symbol.name.upper() for symbol in rspamd_data.symbols}
-        rspamd_action = str(rspamd_data.action or "").lower()
-        rspamd_score = float(rspamd_data.score or 0.0)
-        header_noise_only = bool(
-            symbol_names
-            and symbol_names
-            <= {
-                "SHORT_PART_BAD_HEADERS",
-                "MISSING_ESSENTIAL_HEADERS",
-                "HFILTER_HOSTNAME_UNKNOWN",
-                "MISSING_MID",
-                "MISSING_TO",
-                "R_BAD_CTE_7BIT",
-            }
-        )
-        security_categories = {"spam", "phishing", "spoofing", "suspicious_links", "reputation_issue", "attachment_risk"}
-        if "phishing" in categories or "BLACKLIST_DMARC" in symbol_names or "PHISHING" in symbol_names:
-            verdict = "phishing_or_spoofing"
-        elif "spam" in categories or any("BAYES" in name for name in symbol_names):
-            verdict = "suspicious"
-        elif (
-            rspamd_data.risk_level in {"medium", "high"}
-            and categories & security_categories
-        ) or rspamd_action in {"soft reject", "reject"}:
-            verdict = "suspicious"
-        elif rspamd_action == "reject" and not header_noise_only:
-            verdict = "suspicious"
+    reasons: list[str] = []
+    if rspamd_data:
+        categories = ",".join(sorted(str(item).lower() for item in (rspamd_data.get("categories") or []))) or "none"
         reasons.append(
-            f"rspamd={rspamd_data.risk_level} score={rspamd_data.score:.2f} categories={','.join(sorted(categories)) or 'none'}"
+            f"rspamd={rspamd_data.get('risk_level', 'unknown')} score={float(rspamd_data.get('score') or 0.0):.2f} categories={categories}"
         )
-
-    if header_result.ok and header_data is not None:
-        header_findings = {finding.type for finding in header_data.findings}
-        has_high_header_finding = any(finding.severity == "high" for finding in header_data.findings)
-        has_medium_header_finding = any(finding.severity == "medium" for finding in header_data.findings)
-        explicit_auth_failure = bool({"dmarc_fail", "spf_not_pass", "dkim_not_pass"} & header_findings)
-
-        # Treat header analysis as corroborating evidence rather than a primary detector.
-        if has_high_header_finding and explicit_auth_failure:
-            if verdict == "suspicious":
-                verdict = "phishing_or_spoofing"
-            elif verdict == "benign":
-                verdict = "suspicious"
-        elif has_medium_header_finding and explicit_auth_failure and verdict != "benign":
-            verdict = _max_verdict(verdict, "suspicious")
+    if content_data:
+        reasons.append(
+            f"content_model={content_data.get('risk_level', 'unknown')} score={float(content_data.get('malicious_score') or 0.0):.4f} threshold={float(content_data.get('threshold') or 0.0):.4f}"
+        )
+    if header_data:
         reasons.append(
             "header_auth="
-            f"{header_data.risk_level} findings={len(header_data.findings)} "
-            f"received={header_data.received_count} dkim={header_data.dkim_signature_count}"
+            f"{header_data.get('risk_level', 'unknown')} findings={len(header_data.get('findings') or [])}"
         )
-
-    if urgency_data is not None:
+    if url_data:
         reasons.append(
-            f"urgency={urgency_data.risk_contribution} score={urgency_data.urgency_score:.2f} label={urgency_data.urgency_label}"
+            f"url={url_data.get('risk_level', 'unknown')} score={float(url_data.get('phishing_score') or 0.0):.2f} urls={len(url_data.get('extracted_urls') or [])}"
         )
-
-    if url_data is not None:
+    if urgency_data:
         reasons.append(
-            f"url={url_data.risk_level} score={url_data.phishing_score:.2f} urls={len(url_data.extracted_urls)}"
+            f"urgency={urgency_data.get('risk_contribution', 'unknown')} score={float(urgency_data.get('urgency_score') or 0.0):.2f} label={urgency_data.get('urgency_label', 'unknown')}"
         )
-
-    if scam_data is not None:
+    if scam_data:
         reasons.append(
-            f"scam_indicators={scam_data.risk_level} matched={str(bool(scam_data.matched)).lower()} indicators={','.join(scam_data.indicators[:4]) or 'none'}"
+            f"scam_indicators={scam_data.get('risk_level', 'unknown')} matched={str(bool(scam_data.get('matched'))).lower()} indicators={','.join((scam_data.get('indicators') or [])[:4]) or 'none'}"
         )
-
-    if spam_data is not None:
+    if spam_data:
         reasons.append(
-            f"spam_campaign={spam_data.risk_level} matched={str(bool(spam_data.matched)).lower()} indicators={','.join(spam_data.indicators[:4]) or 'none'}"
+            f"spam_campaign={spam_data.get('risk_level', 'unknown')} matched={str(bool(spam_data.get('matched'))).lower()} indicators={','.join((spam_data.get('indicators') or [])[:4]) or 'none'}"
         )
-
-    corroborating_checks_low = (
-        (url_data is None or (url_data.risk_level in {"low", "unknown"} and not url_data.is_suspicious))
-        and (urgency_data is None or urgency_data.risk_contribution in {"low", "unknown"})
-        and (header_data is None or header_data.risk_level in {"low", "unknown"})
-    )
-
-    if verdict != "phishing_or_spoofing":
-        if scam_data is not None and scam_data.matched:
-            if explicit_auth_failure or (url_data is not None and url_data.risk_level in {"medium", "high"}):
-                verdict = "phishing_or_spoofing"
-            else:
-                verdict = _max_verdict(verdict, "suspicious")
-
-        if (
-            url_data is not None
-            and url_data.risk_level == "high"
-            and (
-                explicit_auth_failure
-                or (scam_data is not None and scam_data.matched)
-                or "suspicious_links" in categories
-            )
-        ):
-            verdict = "phishing_or_spoofing"
-
-        if (
-            url_data is not None
-            and url_data.is_suspicious
-            and urgency_data is not None
-            and urgency_data.risk_contribution in {"medium", "high"}
-        ):
-            verdict = _max_verdict(verdict, "suspicious")
-
-        if (
-            spam_data is not None
-            and spam_data.matched
-            and not explicit_auth_failure
-            and not (scam_data is not None and scam_data.matched)
-            and (
-                spam_data.risk_level == "high"
-                or (url_data is not None and url_data.risk_level in {"medium", "high"})
-                or bool(categories & {"spam", "reputation_issue"})
-                or rspamd_action in {"soft reject", "reject"}
-            )
-        ):
-            verdict = _max_verdict(verdict, "suspicious")
-
-        if (
-            verdict == "benign"
-            and explicit_auth_failure
-            and (
-                (url_data is not None and url_data.risk_level in {"medium", "high"})
-                or (urgency_data is not None and urgency_data.risk_contribution in {"medium", "high"})
-                or (scam_data is not None and scam_data.matched)
-            )
-        ):
-            verdict = "suspicious"
-
-    if branded_marketing and corroborating_checks_low:
-        verdict = "benign"
-
     summary = " | ".join(reasons) if reasons else "No analysis details available."
     return verdict, summary
-
 
 def _severity_rank(value: str) -> int:
     return {
@@ -489,7 +472,10 @@ def _analyze_email_message(
 ) -> RecentEmailResult:
     parsed = BytesParser(policy=policy.default).parsebytes(raw_bytes)
     raw_email = raw_bytes.decode("utf-8", errors="replace")
+    body_text = _mail_body_text(raw_bytes) or raw_email
     raw_email_path = write_raw_email(email_address, uid, raw_email)
+    subject = str(parsed.get("Subject") or "")
+    from_address = str(parsed.get("From") or "")
 
     rspamd_skill = RspamdScanEmailSkill(base_url=rspamd_base_url or DEFAULT_RSPAMD_BASE_URL)
     header_skill = EmailHeaderAuthCheckSkill()
@@ -497,6 +483,7 @@ def _analyze_email_message(
     url_reputation_skill = UrlReputationSkill()
     scam_indicator_skill = ScamIndicatorCheckSkill()
     spam_campaign_skill = SpamCampaignCheckSkill()
+    content_skill = ContentModelCheckSkill()
 
     rspamd_result = rspamd_skill.run(
         RspamdScanEmailInput(
@@ -510,46 +497,55 @@ def _analyze_email_message(
             include_raw_headers=False,
         )
     )
+    content_result = content_skill.run(
+        ContentModelCheckInput(
+            email_text=body_text,
+            subject=subject,
+            from_address=from_address,
+        )
+    )
     urgency_result = urgency_skill.run(
         UrgencyCheckInput(
-            subject=str(parsed.get("Subject") or ""),
-            email_text=raw_email,
+            subject=subject,
+            email_text=body_text,
         )
     )
     url_reputation_result = url_reputation_skill.run(
         UrlReputationInput(
-            email_text=raw_email,
+            subject=subject,
+            email_text=body_text,
         )
     )
     scam_indicator_result = scam_indicator_skill.run(
         ScamIndicatorCheckInput(
             raw_email=raw_email,
-            subject=str(parsed.get("Subject") or ""),
-            from_address=str(parsed.get("From") or ""),
+            subject=subject,
+            from_address=from_address,
         )
     )
     spam_campaign_result = spam_campaign_skill.run(
         SpamCampaignCheckInput(
             raw_email=raw_email,
-            email_text=raw_email,
-            subject=str(parsed.get("Subject") or ""),
-            from_address=str(parsed.get("From") or ""),
+            email_text=body_text,
+            subject=subject,
+            from_address=from_address,
         )
     )
     final_verdict, summary = _compose_final_verdict(
         rspamd_result,
         header_result,
+        content_result,
         urgency_result,
         url_reputation_result,
         scam_indicator_result,
         spam_campaign_result,
-        subject=str(parsed.get("Subject") or ""),
-        from_address=str(parsed.get("From") or ""),
+        subject=subject,
+        from_address=from_address,
     )
     error_pattern_context_hint, summary = _load_error_pattern_context(summary)
     final_verdict, error_pattern_hint, error_pattern_applied, summary = _apply_error_pattern_guidance(
-        subject=str(parsed.get("Subject") or ""),
-        from_address=str(parsed.get("From") or ""),
+        subject=subject,
+        from_address=from_address,
         current_verdict=final_verdict,
         rspamd_risk_level=rspamd_result.data.risk_level if rspamd_result.ok and rspamd_result.data else None,
         header_risk_level=header_result.data.risk_level if header_result.ok and header_result.data else None,
@@ -558,8 +554,8 @@ def _analyze_email_message(
         summary=summary,
     )
     final_verdict, memory_hint, memory_applied, summary = _apply_memory_guidance(
-        subject=str(parsed.get("Subject") or ""),
-        from_address=str(parsed.get("From") or ""),
+        subject=subject,
+        from_address=from_address,
         current_verdict=final_verdict,
         summary=summary,
     )
@@ -569,8 +565,8 @@ def _analyze_email_message(
         "email_address": email_address,
         "uid": uid,
         "message_id": parsed.get("Message-ID"),
-        "subject": str(parsed.get("Subject") or ""),
-        "from_address": str(parsed.get("From") or ""),
+        "subject": subject,
+        "from_address": from_address,
         "analyzed_at_utc": analyzed_at_utc,
         "rspamd_risk_level": rspamd_result.data.risk_level if rspamd_result.ok and rspamd_result.data else None,
         "rspamd_score": rspamd_result.data.score if rspamd_result.ok and rspamd_result.data else None,

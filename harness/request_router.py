@@ -6,10 +6,19 @@ from .models import RouterMatch
 
 class EmailAgentRouter:
     def route(self, prompt: str, limit: int = 5) -> list[RouterMatch]:
+        generic_tokens = {
+            "about",
+            "current",
+            "model",
+            "which",
+            "what",
+            "your",
+            "you",
+        }
         tokens = {
             token.lower()
             for token in prompt.replace("/", " ").replace("-", " ").replace("_", " ").split()
-            if token
+            if len(token) >= 4 and token.lower() not in generic_tokens
         }
         matches: list[RouterMatch] = []
         for capability in CAPABILITIES:
@@ -40,4 +49,3 @@ class EmailAgentRouter:
                 )
         matches.sort(key=lambda item: (-item.score, item.kind, item.name))
         return matches[:limit]
-
