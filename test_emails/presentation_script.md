@@ -20,7 +20,7 @@ The trained skill library includes:
 | `error_pattern_memory_check` | Compares current email against past false positives/negatives |
 | `imap_monitor` | Background daemon that monitors a live mailbox continuously |
 
-Last session we added the web UI — a FastAPI + SSE + Vanilla JS interface that streams live skill execution as the agent runs. This session covers what Yihe built on top of that.
+Last session we added UI. This session covers what Yihe built on top of that.
 
 ---
 
@@ -157,7 +157,52 @@ Token cost scales with how many tools the agent calls and how much it deliberate
 
 ---
 
-## Slide 8 — Future Works
+## Slide 8 — New Skill: LLM Gray-Zone Review
+
+**Spoken script:**
+
+The latest addition is a new skill called **LLM Review** — a constrained final-review layer that only activates when the pipeline is genuinely uncertain.
+
+Here is the key design principle: every other skill runs on every email. LLM Review does not. It only triggers when the email falls into a gray zone — meaning the structured skills produced conflicting, weak, or borderline signals that don't cleanly support a verdict.
+
+**What it does:**
+
+Once a gray-zone is detected, LLM Review receives the full email content plus all previously computed skill signals — rspamd score, header auth findings, urgency score, URL reputation, content model output — and is asked to make a final call. It is explicitly instructed to:
+
+- Default to preserving the current verdict
+- Only change the verdict if the evidence is strong, specific, and corroborated across multiple signals
+- Return structured JSON: `verdict / confidence / reason / evidence`
+
+**Three review modes:**
+
+The system decides which mode to enter based on the current verdict and the signal snapshot:
+
+| Mode | Triggered when | What LLM can do |
+|------|---------------|-----------------|
+| `downgrade_fp` | Current verdict is Phishing or Spam, system suspects false positive | Can lower the verdict — but only with ≥ medium confidence and ≥ 4 benign corroborations. Cannot drop a Phishing verdict to Normal if phishing evidence is still present. |
+| `refine_positive` | Current verdict is positive but ambiguous (Spam vs Phishing) | Can upgrade Spam → Phishing (high confidence + account context + ≥3 phishing corroborations), or downgrade with sufficient benign evidence. |
+| `upgrade_fn` | Current verdict is Normal, system suspects false negative | Can raise the verdict — but this is the hardest gate: requires high confidence, content model support, and ≥ 2 independent strong signals. Upgrading to Phishing additionally requires account context, ≥3 phishing corroborations, and ≥3 strong positive signals. |
+
+**When LLM Review is rejected:**
+
+The guardrail layer blocks changes in clearly named cases:
+
+- `fp-guardrail-needs-medium-confidence` — wants to downgrade but isn't confident enough
+- `fp-guardrail-blocked-hard-phishing-to-normal` — wants to clear a Phishing verdict that still has corroborating evidence
+- `fn-guardrail-needs-high-confidence` — wants to upgrade a Normal verdict without high confidence
+- `fn-guardrail-needs-content-support` — content model doesn't support the proposed upgrade
+- `fn-guardrail-needs-two-independent-signals` — not enough independent evidence for an upgrade
+- `positive-refine-needs-high-phish-corroboration` — wants to escalate to Phishing but evidence threshold not met
+
+**Why this matters:**
+
+The existing skills are fast and precise but don't read content semantically. The gray zone is exactly where that matters: an email with mixed header signals, moderate rspamd score, and ambiguous body language. LLM Review covers that gap without replacing the structured pipeline — it is a final check, not a replacement.
+
+The system is designed so that LLM Review is almost never triggered on clear cases. When it is triggered and its proposed change is accepted, it means the structured signals genuinely couldn't decide alone.
+
+---
+
+## Slide 9 — Future Works
 
 **In-App Results Dashboard**
 
