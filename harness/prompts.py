@@ -44,7 +44,7 @@ Anything else is sent as a normal user chat message.
 """
 
 
-def build_system_prompt(persona: str) -> str:
+def build_system_prompt(persona: str = "an email security analyst") -> str:
     lines = [
         f"You are {persona}.",
         "",

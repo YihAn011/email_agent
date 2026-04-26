@@ -1,5 +1,5 @@
 # Presentation Script: Email Guardian — Modular, Context-Aware, Chatbot-Driven
-### Spoken script — 6 slides (~10 minutes)
+### Spoken script — 7 slides (~12 minutes)
 
 ---
 
@@ -14,6 +14,15 @@ The core architecture is built around a shared MCP tool surface. The agent reads
 The system also supports live mailbox binding through IMAP, so it can monitor recent emails, scan incoming mail continuously, and report on the latest inbox activity.
 
 The trained skills include the rspamd scanner, header authentication checker, urgency classifier, and URL reputation scorer. These models were developed from the class dataset and provide the four primary signal channels for the agent.
+
+| Skill | Description |
+|-------|-------------|
+| `rspamd_scan_email` | Open source spam Bayesian filter using regular expressions and basic rules. First-pass scanner. Returns a score against a threshold. |
+| `email_header_auth_check` | Structural component that checks for header authenticity. Checks for domain mismatches and parses SPF, DKIM, DMARC, and ARC results from the headers. |
+| `urgency_check` | Trained on shared dataset. Both optimized for specificity. Logistic regression against TF-IDF. Returns urgency score between 0.0 and 1.0 and boolean verdict. |
+| `url_reputation_check` | Gradient boosting classifier. Returns phishing score between 0 and 1, boolean on suspiciousness, and three-way risk level (low, medium, high). |
+| `error_pattern_memory_check` | Provides context augmentation by comparing current emails against patterns from past false positives and negatives, enabling the agent to learn from historical mistakes and adjust reasoning accordingly. |
+| `imap_monitor` | A background daemon that connects to a real mailbox over IMAP, automatically runs every incoming message through the full skill pipeline. Can run continuously on live email without human intervention. |
 
 This is the baseline capability set we start from, but the architecture is designed to grow beyond these core detectors.
 
@@ -47,7 +56,29 @@ That means the inbox is now bindable: the agent can connect to a mailbox, mainta
 
 ---
 
-## Slide 4 — Model-Agnostic Architecture
+## Slide 4 — The HARNESS Infrastructure Layer
+
+**Spoken script:**
+
+You might ask: if the model itself picks which skills to call, why do we need HARNESS? That is a fair question.
+
+The answer is this: the **model picks which skill to invoke when reasoning about a specific email**. That is the agent reasoning loop. But HARNESS is not about skill selection — HARNESS is about orchestration and interface.
+
+HARNESS handles the framing, guidance, and presentation:
+
+- `prompts.py` builds and manages system prompts and persona configuration. The same model behaves differently depending on the instructions we give it. HARNESS lets us swap personas and prompt strategies without touching the model code.
+- `capability_registry.py` enumerates all available tools and provides usage guidance. The model *could* discover tools on its own, but it performs better with clear, documented examples of when and how to use each one.
+- `runtime.py` manages the persistent MCP client lifecycle. The model cannot manage its own connections; HARNESS keeps the tool channel alive across conversation turns.
+- `request_router.py` analyzes user intent and pre-routes requests intelligently. This is not about replacing the model's reasoning — it is about steering the conversation toward the most relevant capabilities before the model even sees the request.
+- `ui.py` renders results conversationally. The model generates structured tool outputs; HARNESS translates those into human-friendly explanations the user can understand and act on.
+
+Without HARNESS, you have a raw LLM with MCP tools. With HARNESS, you have a product that feels integrated, responds consistently, and guides users toward the right answers.
+
+This is why we built it inspired by Claude Code—to show that the architecture can feel as polished and natural as a real product, not just a research prototype.
+
+---
+
+## Slide 5 — Model-Agnostic Architecture
 
 **Spoken script:**
 
@@ -59,7 +90,7 @@ The skill library is modular: each capability implements the same `BaseSkill` in
 
 ---
 
-## Slide 5 — Reasoning Loop Optimization
+## Slide 6 — Reasoning Loop Optimization
 
 **Spoken script:**
 
@@ -71,7 +102,7 @@ If your screenshot confirms a 20–30 second improvement per email, this is the 
 
 ---
 
-## Slide 6 — What This Means and What Comes Next
+## Slide 7 — What This Means and What Comes Next
 
 **Spoken script:**
 
@@ -85,4 +116,4 @@ This makes the project less about a single benchmark and more about building a r
 
 ---
 
-*End of script. Estimated speaking time: ~10 minutes.*
+*End of script. Estimated speaking time: ~12 minutes.*
