@@ -1,119 +1,178 @@
-# Presentation Script: Email Guardian — Modular, Context-Aware, Chatbot-Driven
-### Spoken script — 7 slides (~12 minutes)
+# Presentation Script: Email Guardian — Desktop App, Benchmark Results & New Skills
+### Spoken script — updated for final demo (~15 minutes)
 
 ---
 
-## Slide 1 — Where We Were
+## Slide 1 — Where We Were (Recap)
 
 **Spoken script:**
 
-This project is an Skill-based AI email classification agent with CLI integration in the form of a chatbot. We have a reusable skill library, an AI agent reasoning loop, IMAP inbox integration, and ML-based classification skills trained from the dataset provided in class.
+This project is a skill-based AI email classification agent. The core architecture is a reasoning loop: the agent reads an email, chooses which MCP tools to invoke, and uses those tool outputs as evidence to form a verdict rather than applying fixed rules.
 
-The core architecture is built around a shared MCP tool surface. The agent reads the email, chooses which tools to call, and uses the tool outputs as evidence instead of hard-coded verdicts. That reasoning loop is the key innovation.
+The trained skill library includes:
 
-The system also supports live mailbox binding through IMAP, so it can monitor recent emails, scan incoming mail continuously, and report on the latest inbox activity.
-
-The trained skills include the rspamd scanner, header authentication checker, urgency classifier, and URL reputation scorer. These models were developed from the class dataset and provide the four primary signal channels for the agent.
-
-| Skill | Description |
+| Skill | What it does |
 |-------|-------------|
-| `rspamd_scan_email` | Open source spam Bayesian filter using regular expressions and basic rules. First-pass scanner. Returns a score against a threshold. |
-| `email_header_auth_check` | Structural component that checks for header authenticity. Checks for domain mismatches and parses SPF, DKIM, DMARC, and ARC results from the headers. |
-| `urgency_check` | Trained on shared dataset. Both optimized for specificity. Logistic regression against TF-IDF. Returns urgency score between 0.0 and 1.0 and boolean verdict. |
-| `url_reputation_check` | Gradient boosting classifier. Returns phishing score between 0 and 1, boolean on suspiciousness, and three-way risk level (low, medium, high). |
-| `error_pattern_memory_check` | Provides context augmentation by comparing current emails against patterns from past false positives and negatives, enabling the agent to learn from historical mistakes and adjust reasoning accordingly. |
-| `imap_monitor` | A background daemon that connects to a real mailbox over IMAP, automatically runs every incoming message through the full skill pipeline. Can run continuously on live email without human intervention. |
+| `rspamd_scan_email` | Bayesian spam filter — returns a score and risk level |
+| `email_header_auth_check` | Checks SPF, DKIM, DMARC, ARC, and domain mismatches |
+| `urgency_check` | Logistic regression on TF-IDF — returns urgency score 0→1 |
+| `url_reputation_check` | Gradient boosting — returns phishing score 0→1 and risk level |
+| `error_pattern_memory_check` | Compares current email against past false positives/negatives |
+| `imap_monitor` | Background daemon that monitors a live mailbox continuously |
 
-This is the baseline capability set we start from, but the architecture is designed to grow beyond these core detectors.
+Last session we added the web UI — a FastAPI + SSE + Vanilla JS interface that streams live skill execution as the agent runs. This session covers what Yihe built on top of that.
 
 ---
 
-## Slide 2 — Context-Augmented Learning
+## Slide 2 — What Yihe Built: Desktop Application (3 Commits)
 
 **Spoken script:**
 
-The first new feature is memory-based context augmentation. The agent now keeps an error pattern file that stores past false positives and false negatives.
+Yihe made three commits this week. Together they deliver a native desktop application that replaces the browser as the front door to the agent.
 
-Before finalizing a verdict, the agent loads that memory with prompts like `call list_error_patterns` and then verifies the current prediction with `call error_pattern_memory_check`. This is how the agent actively learns from context and previous history.
+**Commit 1 — `ui-pet`:** The initial desktop application built on PySide6 (Qt for Python). This commit introduced the full 1614-line `desktop_pet.py` file — the entire app from scratch. Also added the A/B memory experiment runner in `dataset/run_agent_memory_ab_test.py`.
 
-That means the system is not just replaying static rules. It compares the current email against prior mistakes, adjusts its reasoning based on similar past cases, and uses a feedback loop to improve over time.
+**Commit 2 — `pet`:** Extended the app with the full launch script `scripts/start_full_stack.sh` (201 lines), which starts Redis, Rspamd or mock Rspamd, and Ollama if configured, then launches the desktop app — one command to bring up the entire stack.
 
-This layer is model-agnostic: the memory and tool workflow work with any decision-maker, so the architecture can support different LLMs or reasoning engines without changing the underlying skill surface.
+**Commit 3 — `readme`:** Updated README with setup and run instructions for the new app.
+
+The app is called **Email Guardian**. Here is what it looks like and how it works:
+
+- A 72×72 pixel ball widget sits in the bottom-right corner of the screen, always on top of other windows. Color-coded: grey=starting, green=ready, orange=analyzing, red=error.
+- Click the ball — it animates open into a 1180×680 panel with three panes: controls sidebar, inbox browser, chat.
+- Click the ball inside the panel to collapse it back out of the way.
+
+This is what we called the "desktop pet" concept: persistent, unobtrusive, always accessible.
 
 ---
 
-## Slide 3 — New CLI Chatbot Interface
+## Slide 3 — Desktop App Features
 
 **Spoken script:**
 
-The second new feature is a Claude-style terminal chatbot interface. Users can interact with the agent naturally, ask it to analyze emails, and receive explanations in conversational form.
+The panel has three panes working together:
 
-The CLI supports routes: it matches user intent to capabilities and tools, so the agent can decide whether to scan a raw email, parse headers, bind an IMAP inbox, or report on recent monitored messages.
+**Left sidebar:** Model and provider selection (Gemini or Ollama), live switching, mailbox binding (email address, IMAP host, app password), inbox controls, and action buttons — Sample Email, Email File, Paste Email, Paste Headers, Chat View, Reset, Help.
 
-Its outputs include concise verdicts, confidence levels, evidence summaries, and recommended next steps. It also exposes mailbox commands like `bind_imap_mailbox`, `start_imap_monitor`, `poll_imap_mailboxes_once`, `imap_monitor_status`, and `list_recent_email_results`.
+**Middle pane — Mailbox Browser:** After binding your IMAP account, this pane loads your actual inbox paginated 10 messages at a time. You can click any message to read its full body. You can **select up to 3 messages** and click "Use Selected Emails In Chat" — the app builds a structured multi-email prompt and sends it to the agent. Each email gets its own verdict section in the response.
 
-That means the inbox is now bindable: the agent can connect to a mailbox, maintain monitoring state, and answer questions about the newest messages rather than only analyzing one-off inputs.
+**Right pane — Chat:** A progress log at the top shows tool invocations in real time as the agent works. The chat history and AI response render below. Text input and Send at the bottom.
+
+The single most interesting feature is the multi-email analysis: select three different emails, hit one button, get three separate security verdicts with evidence in one agent run.
 
 ---
 
-## Slide 4 — The HARNESS Infrastructure Layer
+## Slide 4 — Benchmark: The 4 Test Emails
 
 **Spoken script:**
 
-You might ask: if the model itself picks which skills to call, why do we need HARNESS? That is a fair question.
+Now to the results. The benchmark was run against 4 hand-crafted test emails designed to cover the key edge cases a real inbox would surface. These are not from a public dataset — they were written to represent realistic scenarios:
 
-The answer is this: the **model picks which skill to invoke when reasoning about a specific email**. That is the agent reasoning loop. But HARNESS is not about skill selection — HARNESS is about orchestration and interface.
+| # | Email | Threat Level | Why It's Interesting |
+|---|-------|-------------|----------------------|
+| 1 | QuickBooks invoice phishing | Obvious phishing | Classic impersonation — easy case |
+| 2 | Columbia IT maintenance notice | Legitimate | Should be benign — false positive risk |
+| 3 | Shopify flash-sale marketing | Ambiguous | Urgency language but legitimate sender |
+| 4 | Columbia IT security alert spear phish | Spear phishing | Sophisticated impersonation of trusted domain |
 
-HARNESS handles the framing, guidance, and presentation:
-
-- `prompts.py` builds and manages system prompts and persona configuration. The same model behaves differently depending on the instructions we give it. HARNESS lets us swap personas and prompt strategies without touching the model code.
-- `capability_registry.py` enumerates all available tools and provides usage guidance. The model *could* discover tools on its own, but it performs better with clear, documented examples of when and how to use each one.
-- `runtime.py` manages the persistent MCP client lifecycle. The model cannot manage its own connections; HARNESS keeps the tool channel alive across conversation turns.
-- `request_router.py` analyzes user intent and pre-routes requests intelligently. This is not about replacing the model's reasoning — it is about steering the conversation toward the most relevant capabilities before the model even sees the request.
-- `ui.py` renders results conversationally. The model generates structured tool outputs; HARNESS translates those into human-friendly explanations the user can understand and act on.
-
-Without HARNESS, you have a raw LLM with MCP tools. With HARNESS, you have a product that feels integrated, responds consistently, and guides users toward the right answers.
-
-This is why we built it inspired by Claude Code—to show that the architecture can feel as polished and natural as a real product, not just a research prototype.
+**Conditions:** Two runs per email. First run: **baseline** — all 4 skills executed deterministically on every email, no LLM, hard-coded verdict logic. Second run: **agent** — Gemini 2.5 Flash via MCP, adaptive skill selection, agent decides which tools to call and how many.
 
 ---
 
-## Slide 5 — Model-Agnostic Architecture
+## Slide 5 — Results: Accuracy and Verdicts
 
 **Spoken script:**
 
-The architecture is intentionally model-agnostic. The tool library, prompts, and reasoning loop are separate from the underlying language model.
+Here is the verdict comparison:
 
-That means we can swap the decision engine without rewriting the skills. Whether the agent runs on Gemini, an open-source model, or a future provider, the same MCP tool surface and reasoning workflow remain the core.
+| Email | True Label | Baseline | Agent | Baseline Correct? | Agent Correct? |
+|-------|-----------|---------|-------|-------------------|---------------|
+| Obvious Phishing | phishing | phishing_or_spoofing | Phishing (high confidence) | ✓ | ✓ |
+| Legitimate | benign | **phishing_or_spoofing** | Benign (high confidence) | **✗ FALSE POSITIVE** | ✓ |
+| Ambiguous marketing | suspicious | phishing_or_spoofing | **Suspicious** (moderate) | Over-classified | ✓ More nuanced |
+| Spear Phishing | phishing | phishing_or_spoofing | Phishing (high confidence) | ✓ | ✓ |
 
-The skill library is modular: each capability implements the same `BaseSkill` interface, exposing a consistent `run()` contract and `SkillResult` envelope. This makes it easy to add new detectors or memory tools while preserving the overall architecture.
+**Accuracy:**
+- Baseline: 3/4 (75%) — misclassified the legitimate Columbia IT email as phishing
+- Agent: 4/4 (100%) — correctly identified all four, including the false positive the baseline missed
+
+**False Positive Rate:**
+- Baseline: 1 out of 1 legitimate email flagged = **100% FPR** on the legitimate case
+- Agent: 0 false positives = **0% FPR**
+
+The key insight: the baseline's hard-coded logic cannot recover from a high rspamd score even when header auth confirms the email is legitimate. The agent read both signals, saw the contradiction, and reasoned that authenticated columbia.edu headers outweigh a noisy rspamd result.
 
 ---
 
-## Slide 6 — Reasoning Loop Optimization
+## Slide 6 — Results: Skills Invoked
 
 **Spoken script:**
 
-There is also an important runtime optimization in a branch named `benchmark-groq-mcp-fix`. That branch introduces a single persistent MCP client for the chat session using `MultiServerMCPClient`, and it constructs the agent with `create_react_agent`, rather than rebuilding the client or tool surface for every email interaction.
+The agent did not call all 4 skills on every email. It was selective:
 
-In practice, this means the agent keeps one MCP connection alive and reuses the same tool registry across turns. That kind of optimization is exactly what can cut reasoning latency dramatically — the branch is designed to improve per-email speed by tens of seconds.
+| Email | Skills Agent Called | Skills Skipped |
+|-------|--------------------|-|
+| Obvious Phishing | `rspamd_scan_email` (1 skill) | header_auth, urgency, url_reputation |
+| Legitimate | `rspamd_scan_email`, `email_header_auth_check` (2 skills) | urgency, url_reputation |
+| Ambiguous marketing | All 4 skills | — |
+| Spear Phishing | `rspamd_scan_email`, `email_header_auth_check` (2 skills) | urgency, url_reputation |
 
-If your screenshot confirms a 20–30 second improvement per email, this is the branch responsible: it is the one that moves the system from repeated setup to a unified MCP client runtime.
+**Most-invoked skill: `rspamd_scan_email`** — called in all 4 runs. It is always the agent's first move; a high rspamd score is sufficient evidence for obvious phishing.
+
+**Second most-invoked: `email_header_auth_check`** — called in 3 of 4 runs. The agent reaches for header auth whenever rspamd alone is not conclusive.
+
+`urgency_check` and `url_reputation_check` were only invoked on the ambiguous Shopify email — the one case where all signals conflicted. The agent correctly recognized it needed more evidence before committing.
 
 ---
 
-## Slide 7 — What This Means and What Comes Next
+## Slide 7 — Results: Latency and Tokens
 
 **Spoken script:**
 
-The system has moved from a fixed comparison experiment to a flexible, extensible platform.
+There is a cost to the agent's better accuracy: time and tokens.
 
-It now combines trained ML detectors, IMAP mailbox monitoring, context-augmented error pattern memory, and a conversational chatbot interface. The reasoning loop is central: tools provide evidence, the agent evaluates that evidence, and memory helps the agent learn from past mistakes.
+**Latency:**
 
-The next step is adding a semantic phishing reasoner — a structured LLM skill that reads the full email and returns a confidence score. With that added, the architecture can decide when cheaper detectors are enough and when to invoke the more expensive semantic reasoning path.
+| Email | Baseline | Agent | Ratio |
+|-------|---------|-------|-------|
+| Obvious Phishing | 1,881 ms | 8,476 ms | 4.5× |
+| Legitimate | 51 ms | 16,015 ms | 314× |
+| Ambiguous marketing | 49 ms | 64,183 ms | 1,309× |
+| Spear Phishing | 49 ms | 14,483 ms | 296× |
 
-This makes the project less about a single benchmark and more about building a reusable email security reasoning platform.
+The baseline is fast because it is pure local ML — no LLM calls, no network round-trips to the model API. The agent is slower because every tool call involves model reasoning. The Ambiguous email took over a minute because the agent called all 4 skills and still deliberated before committing to "suspicious."
+
+**Token usage (agent only):**
+
+| Email | Tokens In | Tokens Out | Total |
+|-------|-----------|------------|-------|
+| Obvious Phishing | 5,156 | 2,372 | 7,528 |
+| Legitimate | 10,010 | 2,998 | 13,008 |
+| Ambiguous marketing | ~12,000 | ~3,200 | ~15,200 |
+| Spear Phishing | 6,947 | 2,307 | 9,254 |
+
+Token cost scales with how many tools the agent calls and how much it deliberates. The ambiguous email cost roughly twice as many tokens as the obvious phishing case.
+
+**The tradeoff in one sentence:** the baseline is 300× faster but produced a false positive that would have alarmed a real user about a legitimate IT email. The agent took longer but got it right.
 
 ---
 
-*End of script. Estimated speaking time: ~12 minutes.*
+## Slide 8 — Future Works
+
+**In-App Results Dashboard**
+
+The next milestone is closing the feedback loop between the agent's classifications and the user. We plan to add a results dashboard directly inside the desktop app — no external tools needed.
+
+Key features:
+- Select any subset of emails from your bound mailbox and run the agent across all of them in batch
+- Results populate a live chart as each email finishes — verdict distribution (benign / suspicious / phishing) shown as a bar or pie chart
+- Summary statistics: total analyzed, breakdown by verdict, average confidence, skills invoked per email
+- Export button for the raw results
+
+The goal is to let a user point the agent at their inbox, run it, and immediately see a visual picture of their mailbox's threat landscape — without writing any code or reading JSON.
+
+This builds directly on the A/B memory experiment infrastructure already in `dataset/run_agent_memory_ab_test.py`, which proved the batch pipeline works. The dashboard is the user-facing version of that same capability.
+
+---
+
+*End of script. Estimated speaking time: ~15 minutes.*
